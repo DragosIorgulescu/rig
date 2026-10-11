@@ -521,6 +521,29 @@ func TestScheduledList_PausingShowsWhatItIsDoingWhileTheDaemonWorks(t *testing.T
 	require.Contains(t, viewOf(asModel(t, next)), "Asking for a run...")
 }
 
+// Whatever is in flight, n opens no composer: a schedule step opened under a
+// pending operation would ignore every key, esc included, until it ended.
+func TestScheduledList_NAndAOpenNoComposerWhileAnyOperationIsInFlight(t *testing.T) {
+	for _, op := range []pendingOp{
+		opCreating, opDeleting, opSwitching, opImporting, opShelving, opRenaming, opEditingSchedule,
+		opTogglingSchedule, opRunningSchedule,
+	} {
+		for _, pressed := range []string{"n", "a"} {
+			m := scheduledList(t, scheduledFrontend(nil))
+			m.pending = op
+			draft := m.draft
+
+			next, cmd := m.Update(key(pressed))
+
+			require.Nil(t, cmd, "%v %s", op, pressed)
+			got := asModel(t, next)
+			require.Equal(t, modeBrowse, got.mode, "%v %s", op, pressed)
+			require.False(t, got.draft.scheduled, "%v %s", op, pressed)
+			require.Equal(t, draft, got.draft, "%v %s: the draft of the user is left alone", op, pressed)
+		}
+	}
+}
+
 func TestScheduledList_OneThingAtATime(t *testing.T) {
 	m := scheduledList(t, scheduledFrontend(nil))
 	m.pending = opShelving

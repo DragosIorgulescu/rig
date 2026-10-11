@@ -825,7 +825,8 @@ func TestRepositoryNew_MigratesDatabaseWithSquashedMigrationHistory(t *testing.T
 	require.Contains(t, tableColumnNames(t, reopened.db, "tasks"), "kind")
 	require.Subset(t, tableColumnNames(t, reopened.db, "scheduled_tasks"), []string{
 		"task_id", "cron", "prompt", "session_mode", "permission_mode", "enabled", "next_run_at",
-		"run_state", "run_started_at", "last_run_at", "last_outcome", "last_detail", "created_at", "updated_at",
+		"run_state", "run_started_at", "last_run_at", "last_outcome", "last_detail", "run_skipped_at",
+		"run_skipped_detail", "created_at", "updated_at",
 	})
 }
 
@@ -1061,6 +1062,8 @@ func TestRepositoryNew_CreatesSchemaForTasksAndLatestStatuses(t *testing.T) {
 		"last_run_at",
 		"last_outcome",
 		"last_detail",
+		"run_skipped_at",
+		"run_skipped_detail",
 		"created_at",
 		"updated_at",
 	}

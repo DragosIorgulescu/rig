@@ -373,6 +373,21 @@ func (r *repository) BusyMarkers() []string {
 	return slices.Clone(busyMarkers)
 }
 
+// permissionMarkers are the texts Codex's screen shows only while it waits for
+// the user to answer an approval: its footer ("Press enter to confirm or esc
+// to cancel"), its questions ("Would you like to run the following command?",
+// "Would you like to make the following edits?") and its last choice ("No, and
+// tell Codex what to do differently (esc)"). They are matched without regard
+// to case. This is the one place they are kept.
+var permissionMarkers = []string{
+	"esc to cancel", "would you like to run", "would you like to make", "tell codex what to do differently",
+}
+
+// PermissionMarkers returns the texts that mean Codex waits on an approval.
+func (r *repository) PermissionMarkers() []string {
+	return slices.Clone(permissionMarkers)
+}
+
 func (r *repository) codexTaskCommand(env core.ProviderEnv, args ...string) ([]string, error) {
 	codexHome, err := r.resolveCodexHomeDir(env)
 	if err != nil {

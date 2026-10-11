@@ -175,3 +175,15 @@ func TestRepositoryBusyMarkers_AreWhatCodexShowsOnlyWhileATurnRuns(t *testing.T)
 	repo.BusyMarkers()[0] = "changed"
 	require.Equal(t, []string{"esc to interrupt"}, repo.BusyMarkers(), "the list is the repository's own")
 }
+
+func TestRepositoryPermissionMarkers_AreWhatCodexShowsOnlyWhileAnApprovalWaits(t *testing.T) {
+	repo := New(subprocess.NewMockRunner(t), Config{Binary: "codex"}, HookForwardingConfig{}).(*repository)
+
+	want := []string{
+		"esc to cancel", "would you like to run", "would you like to make", "tell codex what to do differently",
+	}
+	require.Equal(t, want, repo.PermissionMarkers())
+
+	repo.PermissionMarkers()[0] = "changed"
+	require.Equal(t, want, repo.PermissionMarkers(), "the list is the repository's own")
+}

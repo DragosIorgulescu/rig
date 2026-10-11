@@ -79,3 +79,13 @@ func TestRepositoryBusyMarkers_AreWhatClaudeShowsOnlyWhileATurnRuns(t *testing.T
 	repo.BusyMarkers()[0] = "changed"
 	require.Equal(t, []string{"esc to interrupt"}, repo.BusyMarkers(), "the list is the repository's own")
 }
+
+func TestRepositoryPermissionMarkers_AreWhatClaudeShowsOnlyWhileADialogWaits(t *testing.T) {
+	repo, _ := newTestRepository(t, subprocess.NewMockRunner(t))
+
+	want := []string{"esc to cancel", "do you want to", "tell claude what to do differently"}
+	require.Equal(t, want, repo.PermissionMarkers())
+
+	repo.PermissionMarkers()[0] = "changed"
+	require.Equal(t, want, repo.PermissionMarkers(), "the list is the repository's own")
+}

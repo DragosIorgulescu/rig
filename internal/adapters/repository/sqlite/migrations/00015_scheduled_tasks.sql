@@ -4,7 +4,10 @@ alter table tasks add column kind text not null default '';
 
 -- The schedule of a scheduled task. Times are RFC 3339 UTC, or '' when unset.
 -- run_state is 'running' from the moment a run starts until a hook says its
--- turn ended; last_outcome keeps how the latest run went.
+-- turn ended; last_outcome keeps how the latest run went. A run that is due
+-- while another is running is skipped without touching the running one's
+-- record, so the skip is kept apart in run_skipped_at and run_skipped_detail
+-- until the next run starts.
 create table if not exists scheduled_tasks (
   task_id text primary key,
   cron text not null,
@@ -18,6 +21,8 @@ create table if not exists scheduled_tasks (
   last_run_at text not null default '',
   last_outcome text not null default '',
   last_detail text not null default '',
+  run_skipped_at text not null default '',
+  run_skipped_detail text not null default '',
   created_at text not null,
   updated_at text not null,
   foreign key(task_id) references tasks(id) on delete cascade

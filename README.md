@@ -537,7 +537,7 @@ Keys on the scheduled list:
 | `e` | Edit the prompt, schedule, session mode and permission mode |
 | `r` | Run now, whether or not the schedule is paused; the next scheduled run is unchanged |
 | `z` | Pause the schedule, or resume it |
-| `enter` | Attach to the task's tmux session |
+| `enter` | Attach to the task's tmux session; one that was lost (after a reboot) comes back as a shell, and the next run starts the provider |
 | `d` | Delete the task and its schedule (`x` too), after a confirmation |
 | `space` | Show or hide the details |
 | `s`, `esc` | Back to the current list |
@@ -549,12 +549,20 @@ schedule as it is now, and you make your edit again.
 
 A run is skipped only while the task's session is busy: working on a turn, or
 waiting on a permission prompt. That is read from the window, where the
-provider shows `esc to interrupt` only during a turn, so a stale status does not
-skip a run. Whether you are looking at the window does not matter. A run that
-started stays `running` until the provider says its turn is over (`ran`), or
-fails with the provider's error or because the session ended. A run missed
-because the daemon was down is made once when it starts again; the runs between
-are not made up.
+provider shows `esc to interrupt` only during a turn, and a permission prompt
+shows its own question and footer, so a stale status does not skip a run: not
+the `working` the provider leaves when you interrupt a turn, and not the
+permission prompt it leaves when you dismiss one. Whether you are looking at
+the window does not matter. In `new` mode, anything in the window that is not a
+shell is ended before the provider starts, an editor or a dev server included.
+A run that started stays `running` until the provider says its turn is over
+(`ran`), or fails with the provider's error or because the session ended; a
+provider that exits while it starts fails the run with the last lines the
+window showed, and one that is gone from the window while the run is `running`
+fails it as the session ended. A run due while another is still `running` is
+skipped, and the row says so beside it (`running since 09:00 · skipped 09:05:
+session busy`). A run missed because the daemon was down is made once when it
+starts again; the runs between are not made up.
 
 ## Renaming
 

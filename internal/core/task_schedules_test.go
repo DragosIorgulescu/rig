@@ -823,6 +823,338 @@ func TestHandleHookEvent_EndsTheRunInFlightByWhatTheHookSays(t *testing.T) {
 	}
 }
 
+// --- a run belongs to the session that took its prompt
+
+// twoSessions records an old provider session of the fixture's Task and a new
+// one that began after the run did, as a `new` run leaves them.
+func (f *scheduleFixture) twoSessions() {
+	f.taskRepo.mu.Lock()
+	defer f.taskRepo.mu.Unlock()
+	f.taskRepo.providerSessionsByTask["task-1"] = []TaskProviderSession{
+		{
+			TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "old-session",
+			FirstObservedAt: scheduleStart.Add(-time.Hour), LastObservedAt: scheduleStart.Add(-time.Minute),
+		},
+		{
+			TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "new-session",
+			FirstObservedAt: scheduleStart.Add(time.Second), LastObservedAt: scheduleStart.Add(time.Second),
+		},
+	}
+}
+
+// The session a `new` run replaced can report its end after the run's own
+// session began: its hooks are processes of their own, and the daemon takes
+// them as they come.
+func TestHandleHookEvent_AnEventOfTheSessionBeforeDoesNotEndTheRun(t *testing.T) {
+	events := []struct {
+		name   string
+		update TaskStatusUpdate
+	}{
+		{"session end", TaskStatusUpdate{Phase: TaskStatusPhaseStopped, RawEventName: HookEventSessionEnd}},
+		{"stop", TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop}},
+		{"stop failure", TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStopFailure}},
+	}
+	for _, tt := range events {
+		t.Run(tt.name, func(t *testing.T) {
+			f := scheduledHookFixture(t)
+			f.twoSessions()
+			update := tt.update
+
+			err := f.deliver(&update, HookEventInput{
+				EventName: update.RawEventName, SessionID: "old-session", ErrorText: "late",
+			})
+
+			require.NoError(t, err)
+			require.True(t, f.schedule().IsRunning(), "the new session's run is still going")
+			require.Equal(t, ScheduledRunRunning, f.schedule().LastOutcome)
+			require.Equal(t, "sent to the running session", f.schedule().LastDetail)
+		})
+	}
+}
+
+func TestHandleHookEvent_AnEventOfTheRunsOwnSessionEndsIt(t *testing.T) {
+	events := []struct {
+		name    string
+		update  TaskStatusUpdate
+		outcome ScheduledRunOutcome
+	}{
+		{
+			"session end",
+			TaskStatusUpdate{Phase: TaskStatusPhaseStopped, RawEventName: HookEventSessionEnd},
+			ScheduledRunFailed,
+		},
+		{
+			"stop",
+			TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop},
+			ScheduledRunCompleted,
+		},
+		{
+			"stop failure",
+			TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStopFailure},
+			ScheduledRunFailed,
+		},
+	}
+	for _, tt := range events {
+		t.Run(tt.name, func(t *testing.T) {
+			f := scheduledHookFixture(t)
+			f.twoSessions()
+			update := tt.update
+
+			err := f.deliver(&update, HookEventInput{EventName: update.RawEventName, SessionID: "new-session"})
+
+			require.NoError(t, err)
+			require.Equal(t, tt.outcome, f.schedule().LastOutcome)
+			require.False(t, f.schedule().IsRunning())
+		})
+	}
+}
+
+// The store keeps a record for each transcript a session wrote. The end of a
+// session can name none, and is then the first record of its own: made after
+// the next session began, which must not make the session before the latest.
+func TestHandleHookEvent_ALateRecordOfTheSessionBeforeDoesNotMakeItTheLatest(t *testing.T) {
+	oldEarly := TaskProviderSession{
+		TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "old-session", TranscriptPath: "/t/old.jsonl",
+		FirstObservedAt: scheduleStart.Add(-time.Hour),
+	}
+	newer := TaskProviderSession{
+		TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "new-session", TranscriptPath: "/t/new.jsonl",
+		FirstObservedAt: scheduleStart.Add(time.Second),
+	}
+	oldLate := TaskProviderSession{
+		TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "old-session", TranscriptPath: "",
+		FirstObservedAt: scheduleStart.Add(2 * time.Second),
+	}
+	// However the store lists them.
+	orders := map[string][]TaskProviderSession{
+		"by when first seen":      {oldEarly, newer, oldLate},
+		"the late record first":   {oldLate, oldEarly, newer},
+		"the late record between": {oldEarly, oldLate, newer},
+	}
+	for name, sessions := range orders {
+		t.Run(name, func(t *testing.T) {
+			f := scheduledHookFixture(t)
+			f.taskRepo.mu.Lock()
+			f.taskRepo.providerSessionsByTask["task-1"] = append([]TaskProviderSession(nil), sessions...)
+			f.taskRepo.mu.Unlock()
+
+			end := TaskStatusUpdate{Phase: TaskStatusPhaseStopped, RawEventName: HookEventSessionEnd}
+			require.NoError(t, f.deliver(&end, HookEventInput{
+				EventName: HookEventSessionEnd, SessionID: "old-session", OccurredAt: scheduleStart.Add(2 * time.Second),
+			}))
+			require.True(t, f.schedule().IsRunning(), "the end of the session before is not the run's")
+
+			stop := TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop}
+			require.NoError(t, f.deliver(&stop, HookEventInput{
+				EventName: HookEventStop, SessionID: "new-session", OccurredAt: scheduleStart.Add(3 * time.Second),
+			}))
+			require.Equal(t, ScheduledRunCompleted, f.schedule().LastOutcome)
+		})
+	}
+}
+
+func TestHandleHookEvent_AnEventThatNamesNoSessionOrNoKnownSessionStillEndsTheRun(t *testing.T) {
+	stop := TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop}
+	t.Run("it names none", func(t *testing.T) {
+		f := scheduledHookFixture(t)
+		f.twoSessions()
+		update := stop
+
+		require.NoError(t, f.deliver(&update, HookEventInput{EventName: HookEventStop}))
+
+		require.Equal(t, ScheduledRunCompleted, f.schedule().LastOutcome)
+	})
+	t.Run("none is known", func(t *testing.T) {
+		f := scheduledHookFixture(t)
+		update := stop
+
+		require.NoError(t, f.deliver(&update, HookEventInput{EventName: HookEventStop, SessionID: "any-session"}))
+
+		require.Equal(t, ScheduledRunCompleted, f.schedule().LastOutcome)
+	})
+}
+
+func TestHandleHookEvent_OnlyLooksAtTheSessionsOfTheProviderThatSpoke(t *testing.T) {
+	f := scheduledHookFixture(t)
+	f.twoSessions()
+	// A claude session began later than the codex run's: not the run's.
+	f.taskRepo.mu.Lock()
+	f.taskRepo.providerSessionsByTask["task-1"] = append(
+		f.taskRepo.providerSessionsByTask["task-1"],
+		TaskProviderSession{
+			TaskID: "task-1", Provider: ProviderClaude, ProviderSessionID: "claude-session",
+			FirstObservedAt: scheduleStart.Add(time.Minute),
+		},
+	)
+	f.taskRepo.mu.Unlock()
+	stop := TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop}
+
+	require.NoError(t, f.deliver(&stop, HookEventInput{EventName: HookEventStop, SessionID: "new-session"}))
+
+	require.Equal(t, ScheduledRunCompleted, f.schedule().LastOutcome)
+}
+
+func TestHandleHookEvent_EndsTheRunWhenTheSessionsCannotBeRead(t *testing.T) {
+	f := scheduledHookFixture(t)
+	f.service.schedules.tasks = failingSessionsRepository{TaskRepository: f.service.schedules.tasks}
+	stop := TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop}
+
+	require.NoError(t, f.deliver(&stop, HookEventInput{EventName: HookEventStop, SessionID: "old-session"}))
+
+	require.Equal(t, ScheduledRunCompleted, f.schedule().LastOutcome, "what cannot be told is taken as it was")
+}
+
+// failingSessionsRepository is a task repository that cannot list sessions.
+type failingSessionsRepository struct{ TaskRepository }
+
+func (failingSessionsRepository) ListTaskProviderSessions(context.Context, string) ([]TaskProviderSession, error) {
+	return nil, errors.New("database is locked")
+}
+
+// countingSessionsRepository is a task repository that counts how often the
+// sessions of a task are listed.
+type countingSessionsRepository struct {
+	TaskRepository
+	listed *int
+}
+
+func (r countingSessionsRepository) ListTaskProviderSessions(
+	ctx context.Context,
+	taskID string,
+) ([]TaskProviderSession, error) {
+	*r.listed++
+	return r.TaskRepository.ListTaskProviderSessions(ctx, taskID)
+}
+
+func TestHandleHookEvent_ReportsARunItCouldNotReadAndLeavesItBe(t *testing.T) {
+	f := scheduledHookFixture(t)
+	f.service.schedules.tasks = failingGetRepository{TaskRepository: f.service.schedules.tasks}
+
+	err := f.deliver(
+		&TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop},
+		HookEventInput{EventName: HookEventStop},
+	)
+
+	require.NoError(t, err, "the hook itself was handled")
+	require.Len(t, f.reported(), 1)
+	require.ErrorContains(t, f.reported()[0], "read the schedule of task task-1: database is locked")
+	require.True(t, f.schedule().IsRunning())
+}
+
+// failingGetRepository is a task repository that cannot read a schedule.
+type failingGetRepository struct{ TaskRepository }
+
+func (failingGetRepository) GetScheduledTask(context.Context, string) (*ScheduledTask, error) {
+	return nil, errors.New("database is locked")
+}
+
+func TestTaskSchedules_AnEventOfAnySessionIsTheRunsWhenNoSessionIsKnown(t *testing.T) {
+	f := newScheduleFixture(t)
+	m := f.service.schedules
+
+	require.True(t, m.fromLatestSession(t.Context(), "task-1", ProviderCodex, "any-session"))
+
+	// Nor does a session of another provider make a latest one.
+	f.taskRepo.mu.Lock()
+	f.taskRepo.providerSessionsByTask["task-1"] = []TaskProviderSession{
+		{TaskID: "task-1", Provider: ProviderClaude, ProviderSessionID: "claude-session"},
+	}
+	f.taskRepo.mu.Unlock()
+	require.True(t, m.fromLatestSession(t.Context(), "task-1", ProviderCodex, "any-session"))
+	require.False(t, m.fromLatestSession(t.Context(), "task-1", ProviderClaude, "any-session"))
+}
+
+func TestTaskSchedules_TheSessionHeardFromLastIsOfTheProviderThatSpoke(t *testing.T) {
+	f := newScheduleFixture(t)
+	m := f.service.schedules
+	f.taskRepo.mu.Lock()
+	f.taskRepo.providerSessionsByTask["task-1"] = []TaskProviderSession{
+		{TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "codex-session", LastObservedAt: scheduleStart},
+		{
+			TaskID: "task-1", Provider: ProviderClaude, ProviderSessionID: "claude-session",
+			LastObservedAt: scheduleStart.Add(time.Hour),
+		},
+	}
+	f.taskRepo.mu.Unlock()
+
+	require.Equal(t, "codex-session", m.lastSession(t.Context(), "task-1", ProviderCodex))
+	require.Equal(t, "claude-session", m.lastSession(t.Context(), "task-1", ProviderClaude))
+	require.Equal(t, "claude-session", m.lastSession(t.Context(), "task-1", ""), "with no provider, any")
+	require.Empty(t, m.lastSession(t.Context(), "task-404", ProviderCodex))
+
+	m.tasks = failingSessionsRepository{TaskRepository: m.tasks}
+	require.Empty(t, m.lastSession(t.Context(), "task-1", ProviderCodex), "sessions that cannot be read name none")
+}
+
+func TestHandleHookEvent_NoSessionsAreListedForATaskWithoutARunInFlight(t *testing.T) {
+	stop := TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop}
+
+	t.Run("an ordinary task", func(t *testing.T) {
+		svc := newTestTaskService(t)
+		svc.taskRepo.listTasks = []*Task{readyTaskFixture()}
+		listed := 0
+		svc.service.schedules.tasks = countingSessionsRepository{
+			TaskRepository: svc.service.schedules.tasks,
+			listed:         &listed,
+		}
+		svc.providerRepo.hookUpdate = &TaskStatusUpdate{
+			TaskID: "task-1", Provider: ProviderCodex, Phase: stop.Phase, RawEventName: stop.RawEventName,
+		}
+
+		err := svc.service.HandleHookEvent(t.Context(), HookEventInput{
+			TaskID: "task-1", Provider: ProviderCodex, EventName: HookEventStop, SessionID: "s1", OccurredAt: time.Now(),
+		})
+
+		require.NoError(t, err)
+		require.Zero(t, listed)
+	})
+	t.Run("a scheduled task between runs", func(t *testing.T) {
+		f := newScheduleFixture(t)
+		listed := 0
+		f.service.schedules.tasks = countingSessionsRepository{
+			TaskRepository: f.service.schedules.tasks,
+			listed:         &listed,
+		}
+		update := stop
+
+		require.NoError(t, f.deliver(&update, HookEventInput{EventName: HookEventStop, SessionID: "s1"}))
+
+		require.Zero(t, listed)
+	})
+}
+
+func TestScheduler_DoesNotEndARunByTheLastWordOfTheSessionBefore(t *testing.T) {
+	// The run began a moment before the scheduler's clock, as it does. The
+	// latest status when it is recorded is the end of the session it replaced,
+	// reported after the new provider was started.
+	startedAt := scheduleNine.Add(-5 * time.Second)
+	f := newScheduleFixture(t)
+	f.useRealRuns()
+	f.runner.result = RunTaskPromptResult{Outcome: PromptRunStarted, Detail: "started fresh", StartedAt: startedAt}
+	f.service.schedules.run = f.runner.run
+	f.taskRepo.mu.Lock()
+	f.taskRepo.latestByTask["task-1"] = TaskStatusUpdate{
+		TaskID: "task-1", Provider: ProviderCodex, Phase: TaskStatusPhaseStopped, RawEventName: HookEventSessionEnd,
+		ObservedAt: startedAt.Add(time.Second),
+	}
+	f.taskRepo.providerSessionsByTask["task-1"] = []TaskProviderSession{
+		{
+			TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "old-session",
+			FirstObservedAt: startedAt.Add(-time.Hour), LastObservedAt: startedAt.Add(time.Second),
+		},
+		{
+			TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "new-session",
+			FirstObservedAt: startedAt.Add(time.Second / 2), LastObservedAt: startedAt.Add(time.Second / 2),
+		},
+	}
+	f.taskRepo.mu.Unlock()
+
+	f.tick(scheduleNine)
+
+	require.True(t, f.schedule().IsRunning(), "the old session ended; the run is the new one's")
+	require.Equal(t, ScheduledRunRunning, f.schedule().LastOutcome)
+}
+
 func TestHandleHookEvent_CapsALongErrorText(t *testing.T) {
 	f := scheduledHookFixture(t)
 

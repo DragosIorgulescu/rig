@@ -431,8 +431,9 @@ type ScheduledTaskRepository interface {
 	// StartScheduledRun records that a run began at the given time: it is in
 	// flight and its outcome is running.
 	StartScheduledRun(ctx context.Context, taskID string, at time.Time, detail string) error
-	// SkipScheduledRun records a skipped run, unless a run is in flight, whose
-	// record stays.
+	// SkipScheduledRun records a skipped run. When a run is in flight its own
+	// record stays as it is, and the skip is kept beside it, in
+	// RunSkippedAt and RunSkippedDetail, until the next run starts.
 	SkipScheduledRun(ctx context.Context, taskID string, at time.Time, detail string) error
 	// FailScheduledRun records a failed run and ends any run in flight.
 	FailScheduledRun(ctx context.Context, taskID string, at time.Time, detail string) error
@@ -577,6 +578,12 @@ type ProviderClient interface {
 	// whatever the provider's last hook said. They are matched without regard
 	// to case.
 	BusyMarkers() []string
+	// PermissionMarkers returns texts the provider's screen shows only while
+	// it is blocked on a permission prompt or a question for the user, such as
+	// "esc to cancel". A hook that says the provider asked for a permission
+	// is believed only while the screen shows one, since dismissing the
+	// prompt sends no hook. They are matched without regard to case.
+	PermissionMarkers() []string
 	// ListFolderSessions lists up to limit (all when limit <= 0) provider
 	// sessions started in folder or any folder below it, most recently active
 	// first, from the provider's
@@ -667,8 +674,10 @@ type TmuxSessionClient interface {
 	InspectTaskSessions(ctx context.Context, tasks []*Task) (map[string]TaskSessionRuntimeState, error)
 	// DeleteTaskSession tears down the task session during task deletion.
 	DeleteTaskSession(ctx context.Context, task *Task) error
-	// TaskPaneShows reports whether any of markers is among the last lines of
-	// the text the task's window shows now, without regard to case.
+	// TaskPaneShows reports whether any of markers is in the text the task's
+	// window shows now, without regard to case. It looks at everything the
+	// window shows, not its history: a provider draws more under its status
+	// line than a few lines, such as a list of todos.
 	TaskPaneShows(ctx context.Context, task *Task, markers []string) (bool, error)
 	// SubmitTaskPrompt sends text to the provider running in the task's window
 	// as one pasted message, however many lines it has, and submits it with

@@ -419,6 +419,15 @@ func (s *service) reconnectTaskSession(ctx context.Context, taskID string) error
 }
 
 func (s *service) reconnectTask(ctx context.Context, task *Task) error {
+	// A Scheduled task's runs start its provider, with the prompt and the
+	// permission mode of its schedule. Its window comes back as a shell, as it
+	// was made: a provider started here would not be the run's, and a later run
+	// in same mode would send its prompt to it.
+	if task.IsScheduled() {
+		_, err := s.launcher.startIdleSession(ctx, task)
+		return err
+	}
+
 	_, providerClient, err := s.launcher.resolveProvider(ctx, task.Provider)
 	if err != nil {
 		return err
@@ -491,7 +500,7 @@ func (s *service) HandleHookEvent(ctx context.Context, input HookEventInput) err
 		return err
 	}
 	if update != nil {
-		s.schedules.resolveRun(ctx, *update, input.ErrorText)
+		s.schedules.resolveRun(ctx, *update, input.ErrorText, input.SessionID)
 	}
 	return nil
 }

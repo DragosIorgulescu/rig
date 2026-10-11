@@ -323,14 +323,90 @@ func (m *taskSchedules) context() context.Context {
 // drives: Stop completes the run, StopFailure fails it with the error the
 // event gave, and SessionEnd fails it as the session ended. A Task with no run
 // in flight, which is every ordinary Task, is left alone.
-func (m *taskSchedules) resolveRun(ctx context.Context, update TaskStatusUpdate, errorText string) {
+//
+// sessionID is the provider session that made the update, or "" when it did
+// not come from one. A run belongs to the latest session of its Task, the one
+// that took its prompt: the end of an earlier session, which a run in new mode
+// replaced, can be reported after the run's own session began, and is not the
+// run's end.
+func (m *taskSchedules) resolveRun(ctx context.Context, update TaskStatusUpdate, errorText string, sessionID string) {
 	outcome, detail, ends := scheduledRunEnd(update, errorText)
 	if !ends {
+		return
+	}
+	schedule, err := m.tasks.GetScheduledTask(ctx, update.TaskID)
+	if err != nil {
+		m.report(fmt.Errorf("read the schedule of task %s: %w", update.TaskID, err))
+		return
+	}
+	if schedule == nil || !schedule.IsRunning() ||
+		!m.fromLatestSession(ctx, update.TaskID, update.Provider, sessionID) {
 		return
 	}
 	if _, err := m.tasks.ResolveScheduledRun(ctx, update.TaskID, outcome, detail); err != nil {
 		m.report(fmt.Errorf("resolve the scheduled run of task %s: %w", update.TaskID, err))
 	}
+}
+
+// fromLatestSession reports whether a provider session is the latest the Task
+// has had with the provider, by when each was first seen. A session that is
+// not named, or sessions that cannot be told, are taken to be it: a run is
+// then ended as it was before sessions were told apart.
+func (m *taskSchedules) fromLatestSession(
+	ctx context.Context,
+	taskID string,
+	provider Provider,
+	sessionID string,
+) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return true
+	}
+	sessions, err := m.tasks.ListTaskProviderSessions(ctx, taskID)
+	if err != nil {
+		return true
+	}
+	// A session is first seen when its earliest record was: the store keeps
+	// one record for each transcript a session wrote, and an event that names
+	// none, as a late SessionEnd can, would otherwise look like a newer session.
+	firstSeen := make(map[string]time.Time, len(sessions))
+	for _, session := range sessions {
+		if provider != "" && session.Provider != provider {
+			continue
+		}
+		id := strings.TrimSpace(session.ProviderSessionID)
+		if seen, known := firstSeen[id]; !known || session.FirstObservedAt.Before(seen) {
+			firstSeen[id] = session.FirstObservedAt
+		}
+	}
+	latest := ""
+	var latestAt time.Time
+	for id, seen := range firstSeen {
+		if latest == "" || seen.After(latestAt) || (seen.Equal(latestAt) && id > latest) {
+			latest, latestAt = id, seen
+		}
+	}
+	return latest == "" || latest == sessionID
+}
+
+// lastSession is the provider session of the Task that was heard from last, or
+// "" when there is none: the one that made the latest status.
+func (m *taskSchedules) lastSession(ctx context.Context, taskID string, provider Provider) string {
+	sessions, err := m.tasks.ListTaskProviderSessions(ctx, taskID)
+	if err != nil {
+		return ""
+	}
+	last := ""
+	var lastAt time.Time
+	for _, session := range sessions {
+		if provider != "" && session.Provider != provider {
+			continue
+		}
+		if last == "" || !session.LastObservedAt.Before(lastAt) {
+			last, lastAt = strings.TrimSpace(session.ProviderSessionID), session.LastObservedAt
+		}
+	}
+	return last
 }
 
 // settleRun ends a run that started if the session's turn is already over by
@@ -344,5 +420,5 @@ func (m *taskSchedules) settleRun(ctx context.Context, taskID string, startedAt 
 	if err != nil || status == nil || !status.ObservedAt.After(startedAt) {
 		return
 	}
-	m.resolveRun(ctx, *status, "")
+	m.resolveRun(ctx, *status, "", m.lastSession(ctx, taskID, status.Provider))
 }

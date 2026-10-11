@@ -436,6 +436,19 @@ func (r *repository) BusyMarkers() []string {
 	return slices.Clone(busyMarkers)
 }
 
+// permissionMarkers are the texts Claude Code's screen shows only while it
+// waits for the user to answer a dialog: the footer of a permission prompt or
+// a question ("Esc to cancel · Tab to amend"), its question ("Do you want to
+// proceed?", "Do you want to make this edit to …?") and its last choice ("No,
+// and tell Claude what to do differently (esc)"). This is the one place they
+// are kept.
+var permissionMarkers = []string{"esc to cancel", "do you want to", "tell claude what to do differently"}
+
+// PermissionMarkers returns the texts that mean Claude Code waits on a dialog.
+func (r *repository) PermissionMarkers() []string {
+	return slices.Clone(permissionMarkers)
+}
+
 // RecoverLatestTaskStatus returns no recovery: Claude status is driven by
 // hook events only in this first version.
 func (r *repository) RecoverLatestTaskStatus(

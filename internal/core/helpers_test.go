@@ -146,12 +146,24 @@ type sessionClientState struct {
 	submitErr       error
 	onSubmit        func(*Task, string)
 	inspectState    TaskSessionRuntimeState
+	// inspectCalls counts the windows looked at, guarded by mu.
+	inspectCalls int
 	// paneShows are the answers TaskPaneShows gives, one per call and the last
 	// one again for every call after it; with none, the window shows nothing
 	// busy. paneChecks are the markers each call was given, guarded by mu.
 	paneShows      []paneShow
 	paneChecks     [][]string
 	paneCheckTimes []time.Time
+	// paneScreen, when it is set, is the text the window shows: TaskPaneShows
+	// answers whether it holds a marker, whatever paneShows says. A pointer to
+	// an empty string is a window that shows nothing.
+	paneScreen *string
+	// captureErr fails CaptureTaskSession, which reads paneScreen.
+	captureErr error
+	// startRunsProvider makes the provider run in the window once a command is
+	// started there, as it does outside of tests; without it the window stays
+	// as the test left it.
+	startRunsProvider bool
 	// onPaneCheck runs at the start of every TaskPaneShows call, outside mu.
 	onPaneCheck func()
 	// submittedPrompts are the prompts sent to the provider in the task
@@ -236,6 +248,9 @@ type providerClientState struct {
 	// busyMarkers are the texts the provider says only a running turn shows;
 	// without any, "esc to interrupt".
 	busyMarkers []string
+	// permissionMarkers are the texts the provider says only a permission
+	// prompt shows; without any, "esc to cancel".
+	permissionMarkers []string
 }
 
 // paneShow is one answer of TaskPaneShows.
@@ -539,6 +554,12 @@ func configureTmuxSessionMock(client *MockTmuxSessionClient, state *sessionClien
 			}
 			state.startedTask = cloneTask(task)
 			state.startedLaunch = launch
+			if state.startRunsProvider && len(launch.Command) > 0 {
+				state.inspectState = TaskSessionRuntimeState{
+					Exists:         true,
+					ActiveCommands: []string{"zsh", "codex"},
+				}
+			}
 			if state.onStart != nil {
 				state.onStart(task)
 			}
@@ -572,6 +593,9 @@ func configureTmuxSessionMock(client *MockTmuxSessionClient, state *sessionClien
 	client.EXPECT().AttachTaskSession(mock.Anything, mock.Anything).Return(nil).Maybe()
 	client.EXPECT().InspectTaskSession(mock.Anything, mock.Anything).RunAndReturn(
 		func(_ context.Context, _ *Task) (TaskSessionRuntimeState, error) {
+			state.mu.Lock()
+			state.inspectCalls++
+			state.mu.Unlock()
 			return state.inspectState, state.inspectErr
 		},
 	).Maybe()
@@ -622,11 +646,33 @@ func configureTmuxSessionMock(client *MockTmuxSessionClient, state *sessionClien
 			call := len(state.paneChecks)
 			state.paneChecks = append(state.paneChecks, append([]string(nil), markers...))
 			state.paneCheckTimes = append(state.paneCheckTimes, time.Now())
+			if state.paneScreen != nil {
+				screen := strings.ToLower(*state.paneScreen)
+				for _, marker := range markers {
+					if strings.Contains(screen, strings.ToLower(marker)) {
+						return true, nil
+					}
+				}
+				return false, nil
+			}
 			if len(state.paneShows) == 0 {
 				return false, nil
 			}
 			answer := state.paneShows[min(call, len(state.paneShows)-1)]
 			return answer.shows, answer.err
+		},
+	).Maybe()
+	client.EXPECT().CaptureTaskSession(mock.Anything, mock.Anything).RunAndReturn(
+		func(context.Context, *Task) (string, error) {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if state.captureErr != nil {
+				return "", state.captureErr
+			}
+			if state.paneScreen == nil {
+				return "", nil
+			}
+			return *state.paneScreen, nil
 		},
 	).Maybe()
 	client.EXPECT().SubmitTaskPrompt(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
@@ -753,6 +799,12 @@ func configureProviderClientMock(client *MockProviderClient, state *providerClie
 			return state.busyMarkers
 		}
 		return []string{"esc to interrupt"}
+	}).Maybe()
+	client.EXPECT().PermissionMarkers().RunAndReturn(func() []string {
+		if len(state.permissionMarkers) > 0 {
+			return state.permissionMarkers
+		}
+		return []string{"esc to cancel"}
 	}).Maybe()
 	client.EXPECT().TaskSessionCommandName().RunAndReturn(state.mockCommandName).Maybe()
 	client.EXPECT().ExitCommand().RunAndReturn(func() string {
@@ -1050,10 +1102,18 @@ func configureTaskRepositoryMock(repo *MockTaskRepository, state *taskRepository
 	repo.EXPECT().UpsertTaskProviderSession(mock.Anything, mock.Anything).RunAndReturn(
 		func(_ context.Context, session TaskProviderSession) error {
 			state.savedProviderSessions = append(state.savedProviderSessions, session)
-			state.providerSessionsByTask[session.TaskID] = append(
-				state.providerSessionsByTask[session.TaskID],
-				session,
-			)
+			// A session seen again keeps when it was first seen, as the store does.
+			known := state.providerSessionsByTask[session.TaskID]
+			for i, existing := range known {
+				if existing.Provider == session.Provider &&
+					existing.ProviderSessionID == session.ProviderSessionID &&
+					existing.TranscriptPath == session.TranscriptPath {
+					known[i].LastObservedAt = session.LastObservedAt
+					known[i].LastEventName = session.LastEventName
+					return nil
+				}
+			}
+			state.providerSessionsByTask[session.TaskID] = append(known, session)
 			return nil
 		},
 	).Maybe()
@@ -1233,6 +1293,7 @@ func configureScheduledTaskRepositoryMock(repo *MockTaskRepository, state *taskR
 				stored.LastRunAt = at
 				stored.LastOutcome = ScheduledRunRunning
 				stored.LastDetail = detail
+				stored.RunSkippedAt, stored.RunSkippedDetail = time.Time{}, ""
 				state.schedules[taskID] = stored
 			}
 			return nil
@@ -1245,10 +1306,15 @@ func configureScheduledTaskRepositoryMock(repo *MockTaskRepository, state *taskR
 			}
 			state.mu.Lock()
 			defer state.mu.Unlock()
-			if stored, ok := state.schedules[taskID]; ok && stored.RunState == ScheduledRunStateIdle {
-				stored.LastRunAt = at
-				stored.LastOutcome = ScheduledRunSkipped
-				stored.LastDetail = detail
+			if stored, ok := state.schedules[taskID]; ok {
+				if stored.RunState == ScheduledRunStateIdle {
+					stored.LastRunAt = at
+					stored.LastOutcome = ScheduledRunSkipped
+					stored.LastDetail = detail
+					stored.RunSkippedAt, stored.RunSkippedDetail = time.Time{}, ""
+				} else {
+					stored.RunSkippedAt, stored.RunSkippedDetail = at, detail
+				}
 				state.schedules[taskID] = stored
 			}
 			return nil
@@ -1266,6 +1332,7 @@ func configureScheduledTaskRepositoryMock(repo *MockTaskRepository, state *taskR
 				stored.LastRunAt = at
 				stored.LastOutcome = ScheduledRunFailed
 				stored.LastDetail = detail
+				stored.RunSkippedAt, stored.RunSkippedDetail = time.Time{}, ""
 				state.schedules[taskID] = stored
 			}
 			return nil

@@ -309,7 +309,26 @@ func (m model) scheduleRowText(schedule *core.ScheduledTask, width int) string {
 		parts = append(parts, textPart{text: "paused", style: warningStyle})
 	}
 	last, lastStyle := lastRunText(*schedule, now)
-	return joinParts(append(parts, textPart{text: last, style: lastStyle}), width)
+	parts = append(parts, textPart{text: last, style: lastStyle})
+	if skipped := skippedBesideRunText(*schedule, now); skipped != "" {
+		parts = append(parts, textPart{text: skipped, style: warningStyle})
+	}
+	return joinParts(parts, width)
+}
+
+// skippedBesideRunText says that a run due while another was in flight was
+// skipped, and why, for a row whose run is still in flight: the run's own
+// record stays as it was, so the skip is told of beside it. It is empty with
+// none, and once the run has ended, when the row is about the run that ended.
+func skippedBesideRunText(schedule core.ScheduledTask, now time.Time) string {
+	if !schedule.IsRunning() || schedule.RunSkippedAt.IsZero() {
+		return ""
+	}
+	text := "skipped " + scheduleMoment(schedule.RunSkippedAt, now)
+	if detail := strings.TrimSpace(schedule.RunSkippedDetail); detail != "" {
+		text += ": " + detail
+	}
+	return text
 }
 
 // scheduleModeText says what a session mode means for a run.
@@ -519,6 +538,26 @@ func lastRunDetailLines(schedule core.ScheduledTask, now time.Time, width int) [
 		}
 		lines = append(lines, label+outcomeStyle.Render(line))
 	}
+	return append(lines, skippedBesideRunDetailLines(schedule, now, width)...)
+}
+
+// skippedBesideRunDetailLines is the skip of a run due while another was in
+// flight, in full: when, and the reason, wrapped to width. It stays on the
+// panel after the run it was due beside has ended, until the next run starts.
+func skippedBesideRunDetailLines(schedule core.ScheduledTask, now time.Time, width int) []string {
+	if schedule.RunSkippedAt.IsZero() {
+		return nil
+	}
+	lines := []string{mutedStyle.Render("skipped") + " " + warningStyle.Render(
+		scheduleDateTime(schedule.RunSkippedAt, now)+" · while a run was in progress")}
+	wrapped := wrapFull(strings.TrimSpace(schedule.RunSkippedDetail), width-8)
+	for index, line := range wrapped {
+		label := "        "
+		if index == 0 {
+			label = mutedStyle.Render("why") + "     "
+		}
+		lines = append(lines, label+warningStyle.Render(line))
+	}
 	return lines
 }
 
@@ -675,9 +714,22 @@ func (m model) updateScheduleMessage(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.notice = fmt.Sprintf(
 			"Run requested for %s. How it goes shows on its row.", emptyFallback(msg.task.DisplayName, msg.task.ID),
 		)
+		m.noticeAt = m.now()
 		return m, nil, true
 	default:
 		return m, nil, false
+	}
+}
+
+// scheduleNoticeLifetime is how long a note on a run that was requested stays
+// on screen without a key press: the run is made in the daemon, and its outcome
+// shows on its row, which the note must not stand in for once it is there.
+const scheduleNoticeLifetime = 5 * time.Second
+
+// expireNotice takes the note away once it has been shown for its lifetime.
+func (m *model) expireNotice() {
+	if m.notice != "" && !m.noticeAt.IsZero() && m.now().Sub(m.noticeAt) >= scheduleNoticeLifetime {
+		m.notice, m.noticeAt = "", time.Time{}
 	}
 }
 

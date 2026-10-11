@@ -72,10 +72,10 @@ func (m *taskSchedules) tickOnce(ctx context.Context) {
 		m.report(fmt.Errorf("list tasks for the scheduler: %w", err))
 		return
 	}
-	ready := make(map[string]bool, len(tasks))
+	byID := make(map[string]*Task, len(tasks))
 	for _, task := range tasks {
 		if task != nil {
-			ready[task.ID] = task.CreationStatus == TaskCreationStatusReady
+			byID[task.ID] = task
 		}
 	}
 
@@ -83,10 +83,74 @@ func (m *taskSchedules) tickOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		task := byID[schedule.TaskID]
+		ready := task != nil && task.CreationStatus == TaskCreationStatusReady
+		// A run whose session is gone ends before the schedule is looked at, so
+		// that the run due now is recorded over a run that is over.
+		if schedule.IsRunning() && ready {
+			m.endRunIfSessionGoneSafely(ctx, schedule, task, now)
+		}
 		if schedule.Enabled {
-			m.considerSafely(ctx, schedule, now, ready[schedule.TaskID])
+			m.considerSafely(ctx, schedule, now, ready)
 		}
 	}
+}
+
+// goneSessionGrace is how long a run is left alone before its provider is
+// looked for in the window, so a provider that was only just started is not
+// taken for one that is gone.
+const goneSessionGrace = 10 * time.Second
+
+// endRunIfSessionGoneSafely is endRunIfSessionGone for one schedule among
+// several: a schedule that breaks the scheduler is reported and the others are
+// still looked at.
+func (m *taskSchedules) endRunIfSessionGoneSafely(
+	ctx context.Context,
+	schedule ScheduledTask,
+	task *Task,
+	now time.Time,
+) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			m.report(fmt.Errorf("scheduler panicked looking for the session of task %s: %v\n%s",
+				schedule.TaskID, recovered, debug.Stack()))
+		}
+	}()
+	m.endRunIfSessionGone(ctx, schedule, task, now)
+}
+
+// endRunIfSessionGone fails a run in flight whose provider is no longer in the
+// Task's window. A provider that crashes, is killed by a reboot or exits
+// without saying so sends no Stop or SessionEnd, and nothing else would end
+// the run before the next one. What cannot be told, a window that cannot be
+// inspected or processes that cannot be seen, leaves the run as it is, and so
+// does a run this process is still making.
+func (m *taskSchedules) endRunIfSessionGone(ctx context.Context, schedule ScheduledTask, task *Task, now time.Time) {
+	if now.Sub(schedule.RunStartedAt) < goneSessionGrace || m.isInFlight(schedule.TaskID) {
+		return
+	}
+	_, providerClient, err := m.launcher.resolveProvider(ctx, task.Provider)
+	if err != nil {
+		return
+	}
+	runtime, err := m.launcher.tmuxSession.InspectTaskSession(ctx, task)
+	if err != nil || (runtime.Exists && runtime.ChildProcessEvidenceUnavailable) {
+		return
+	}
+	if taskSessionRunningProvider(runtime, providerClient.TaskSessionCommandName()) {
+		return
+	}
+	_, err = m.tasks.ResolveScheduledRun(ctx, schedule.TaskID, ScheduledRunFailed, "the session ended")
+	if err != nil {
+		m.report(fmt.Errorf("end the run of task %s: %w", schedule.TaskID, err))
+	}
+}
+
+// isInFlight reports whether this process is making a run for the Task.
+func (m *taskSchedules) isInFlight(taskID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inFlight[taskID]
 }
 
 // considerSafely is consider for one schedule among several: a schedule that

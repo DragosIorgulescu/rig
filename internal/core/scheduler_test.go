@@ -593,6 +593,7 @@ func TestScheduler_RecordsNothingForARunTheDaemonStoppingCutShort(t *testing.T) 
 
 func TestScheduler_LeavesTheRecordOfARunInFlightWhenALaterRunIsSkipped(t *testing.T) {
 	f := newScheduleFixture(t)
+	idleProvider(f.testTaskServiceHarness)
 	f.edit(func(s *ScheduledTask) {
 		s.RunState = ScheduledRunStateRunning
 		s.RunStartedAt = scheduleStart
@@ -609,6 +610,8 @@ func TestScheduler_LeavesTheRecordOfARunInFlightWhenALaterRunIsSkipped(t *testin
 	require.Equal(t, before.LastOutcome, f.schedule().LastOutcome, "it still says the run is running")
 	require.Equal(t, before.LastDetail, f.schedule().LastDetail)
 	require.Equal(t, before.LastRunAt, f.schedule().LastRunAt)
+	require.Equal(t, scheduleNine, f.schedule().RunSkippedAt, "but the skip is told of, beside it")
+	require.Equal(t, "session busy", f.schedule().RunSkippedDetail)
 }
 
 func TestScheduler_ReplacesTheRecordOfARunLeftInFlightWhenTheNextRunStarts(t *testing.T) {
@@ -627,6 +630,192 @@ func TestScheduler_ReplacesTheRecordOfARunLeftInFlightWhenTheNextRunStarts(t *te
 	require.Equal(t, ScheduledRunStateRunning, stored.RunState)
 	require.Equal(t, scheduleNine, stored.RunStartedAt, "the new run is the one in flight")
 	require.Equal(t, scheduleNine, stored.LastRunAt)
+}
+
+// --- a run whose session is gone
+
+// runInFlight is a run that began at 08:00, an hour before the schedule is next
+// due.
+func (f *scheduleFixture) runInFlight() {
+	f.edit(func(s *ScheduledTask) {
+		s.RunState = ScheduledRunStateRunning
+		s.RunStartedAt = scheduleStart
+		s.LastRunAt = scheduleStart
+		s.LastOutcome = ScheduledRunRunning
+		s.LastDetail = "sent to the running session"
+		s.NextRunAt = scheduleNine.Add(24 * time.Hour)
+	})
+}
+
+// A provider that crashes, is killed by a reboot or exits without a hook
+// leaves no Stop and no SessionEnd to end its run. Nobody would, until the
+// next run: a day with a daily schedule.
+func TestScheduler_EndsARunWhoseProviderIsGoneFromTheWindow(t *testing.T) {
+	states := map[string]TaskSessionRuntimeState{
+		"a bare shell":    idlePane(),
+		"no window":       {Exists: false},
+		"another program": {Exists: true, ActiveCommands: []string{"zsh", "vim"}},
+	}
+	for name, state := range states {
+		t.Run(name, func(t *testing.T) {
+			f := newScheduleFixture(t)
+			f.runInFlight()
+			f.sessionClient.inspectState = state
+
+			f.tick(scheduleNine)
+
+			stored := f.schedule()
+			require.False(t, stored.IsRunning())
+			require.Equal(t, ScheduledRunFailed, stored.LastOutcome)
+			require.Equal(t, "the session ended", stored.LastDetail)
+			require.Equal(t, scheduleStart, stored.LastRunAt, "it is still the run that began then")
+			require.Empty(t, f.runner.runs(), "the schedule is not due")
+			require.Empty(t, f.reported())
+		})
+	}
+}
+
+func TestScheduler_EndsTheRunOfAPausedScheduleToo(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.runInFlight()
+	f.edit(func(s *ScheduledTask) { s.Enabled = false })
+
+	f.tick(scheduleNine)
+
+	require.Equal(t, ScheduledRunFailed, f.schedule().LastOutcome)
+	require.Equal(t, "the session ended", f.schedule().LastDetail)
+}
+
+func TestScheduler_OnlyLooksAtTheWindowOfASchedulesWithARunInFlight(t *testing.T) {
+	f := newScheduleFixture(t)
+
+	f.tick(scheduleNine.Add(-time.Hour))
+
+	f.sessionClient.mu.Lock()
+	defer f.sessionClient.mu.Unlock()
+	require.Zero(t, f.sessionClient.inspectCalls, "a schedule with no run in flight has no session to look for")
+}
+
+func TestScheduler_EndsTheRunBeforeTheNextOneIsMade(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.runInFlight()
+	f.edit(func(s *ScheduledTask) { s.NextRunAt = scheduleNine })
+	f.runner.result = RunTaskPromptResult{Outcome: PromptRunSkipped, Detail: "session busy"}
+
+	f.tick(scheduleNine)
+
+	// The run that was gone is not left standing in the way of the record of
+	// the one made now.
+	stored := f.schedule()
+	require.False(t, stored.IsRunning())
+	require.Equal(t, ScheduledRunSkipped, stored.LastOutcome)
+	require.Equal(t, "session busy", stored.LastDetail)
+	require.Len(t, f.runner.runs(), 1)
+}
+
+// The schedule is gone with its task in the store; one that a tick reads while
+// its task is not in the list, a task deleted between the two reads, is not
+// run and is not an error.
+func TestScheduler_DoesNothingForAScheduleWhoseTaskIsNotListed(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.putSchedule(ScheduledTask{
+		TaskID:        "task-ghost",
+		ScheduleInput: ScheduleInput{Cron: "daily 09:00", Prompt: "p", SessionMode: PromptRunSessionNew},
+		Enabled:       true,
+		NextRunAt:     scheduleNine,
+		RunState:      ScheduledRunStateRunning,
+		RunStartedAt:  scheduleStart.Add(-time.Hour),
+		LastOutcome:   ScheduledRunRunning,
+		CreatedAt:     scheduleStart,
+		UpdatedAt:     scheduleStart,
+	})
+
+	f.tick(scheduleNine)
+
+	for _, input := range f.runner.runs() {
+		require.NotEqual(t, "task-ghost", input.TaskID, "a task that is not there cannot take a run")
+	}
+	require.Empty(t, f.reported(), "and it is not looked for either")
+	f.taskRepo.mu.Lock()
+	defer f.taskRepo.mu.Unlock()
+	require.Equal(t, ScheduledRunStateRunning, f.taskRepo.schedules["task-ghost"].RunState)
+}
+
+func TestScheduler_LeavesARunAloneWhileItsProviderRuns(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.runInFlight()
+	idleProvider(f.testTaskServiceHarness)
+
+	f.tick(scheduleNine)
+
+	require.True(t, f.schedule().IsRunning())
+	require.Equal(t, ScheduledRunRunning, f.schedule().LastOutcome)
+}
+
+func TestScheduler_LeavesARunAloneWhenItCannotTellWhetherItsProviderRuns(t *testing.T) {
+	tests := map[string]func(f *scheduleFixture){
+		"the window cannot be inspected": func(f *scheduleFixture) {
+			f.sessionClient.inspectErr = errors.New("tmux exploded")
+		},
+		"its processes cannot be told": func(f *scheduleFixture) {
+			f.sessionClient.inspectState = TaskSessionRuntimeState{
+				Exists: true, ActiveCommands: []string{"zsh"}, ChildProcessEvidenceUnavailable: true,
+			}
+		},
+		"its provider is not configured": func(f *scheduleFixture) {
+			f.providerConfig.setup = &ProviderSetup{Configured: []Provider{ProviderClaude}, Default: ProviderClaude}
+		},
+		"its task is still being created": func(f *scheduleFixture) {
+			f.task.CreationStatus = TaskCreationStatusCreating
+		},
+	}
+	for name, setUp := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := newScheduleFixture(t)
+			f.runInFlight()
+			setUp(f)
+
+			f.tick(scheduleNine)
+
+			require.True(t, f.schedule().IsRunning())
+			require.Empty(t, f.reported(), "what cannot be told is not an error")
+		})
+	}
+}
+
+func TestScheduler_LeavesAFreshRunAloneForAMoment(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.runInFlight()
+
+	f.tick(scheduleStart.Add(goneSessionGrace - time.Second))
+	require.True(t, f.schedule().IsRunning(), "the provider may only just have been started")
+
+	f.tick(scheduleStart.Add(goneSessionGrace))
+	require.False(t, f.schedule().IsRunning())
+}
+
+func TestScheduler_LeavesARunAloneWhileThisProcessIsStillMakingIt(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.runInFlight()
+	m := f.service.schedules
+	m.mu.Lock()
+	m.inFlight["task-1"] = true
+	m.mu.Unlock()
+
+	f.tick(scheduleNine)
+
+	require.True(t, f.schedule().IsRunning(), "a launch that is still going has no provider yet")
+}
+
+func TestScheduler_ReportsARunItCouldNotEndWhenItsSessionIsGone(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.runInFlight()
+	f.service.schedules.tasks = failingResolveRepository{TaskRepository: f.service.schedules.tasks}
+
+	f.tick(scheduleNine)
+
+	require.Len(t, f.reported(), 1)
+	require.ErrorContains(t, f.reported()[0], "end the run of task task-1: database is locked")
 }
 
 // --- a run that is already over when it is recorded
@@ -1000,12 +1189,35 @@ func TestScheduler_RecordsASessionWaitingOnAPermissionPromptAsSkipped(t *testing
 	runningProvider(f.testTaskServiceHarness, TaskStatusUpdate{
 		Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventNotification,
 	})
+	screen := permissionScreen
+	f.sessionClient.paneScreen = &screen
 
 	f.tick(scheduleNine)
 
 	require.Empty(t, f.sessionClient.submittedPrompts)
 	require.Equal(t, ScheduledRunSkipped, f.schedule().LastOutcome)
 	require.Equal(t, "waiting on a permission prompt", f.schedule().LastDetail)
+}
+
+// The provider sends no hook when the user dismisses a permission prompt, so
+// its status keeps asking. Nothing but the scheduler submits a prompt in a
+// scheduled task's window; if the status were believed, every run after the
+// dismissed prompt would be skipped.
+func TestScheduler_RunsASessionWhoseDismissedPermissionPromptIsStillInItsStatus(t *testing.T) {
+	f := newScheduleFixture(t)
+	f.useRealRuns()
+	runningProvider(f.testTaskServiceHarness, TaskStatusUpdate{
+		Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventNotification,
+	})
+	screen := idleScreen
+	f.sessionClient.paneScreen = &screen
+	providerTakesPrompts(f.testTaskServiceHarness)
+
+	f.tick(scheduleNine)
+
+	require.Equal(t, []string{"triage the open issues"}, f.sessionClient.submittedPrompts)
+	require.Equal(t, ScheduledRunRunning, f.schedule().LastOutcome)
+	require.Equal(t, "sent to the running session", f.schedule().LastDetail)
 }
 
 func TestScheduler_RecordsAPromptTheSessionDidNotTakeAsFailed(t *testing.T) {

@@ -117,8 +117,9 @@ type model struct {
 	// schedule rather than pauses it.
 	scheduleResuming bool
 	// notice is a note on something that went well, shown until the next key
-	// press.
-	notice string
+	// press, or until scheduleNoticeLifetime after noticeAt when that is set.
+	notice   string
+	noticeAt time.Time
 	// clock tells the time the schedules are shown against; nil is the real
 	// clock.
 	clock func() time.Time
@@ -658,7 +659,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A displayed error stays until the user acknowledges it with a key
 		// press; background refreshes must not clear it.
 		m.err = nil
-		m.notice = ""
+		m.notice, m.noticeAt = "", time.Time{}
 
 		if m.showShelf && !shelfKey(msg.String()) {
 			return m, nil
@@ -1088,6 +1089,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampSelection()
 		return m, m.importHintCmd()
 	case activityRefreshTickMsg:
+		m.expireNotice()
 		cmds := []tea.Cmd{activityRefreshTickCmd()}
 		if m.showScheduled {
 			// Runs are made by the daemon, so the next and latest run change

@@ -65,17 +65,19 @@ func TestRepositoryScheduledTasks_RoundTripEveryField(t *testing.T) {
 		UpdatedAt: scheduleNow,
 	}))
 	busy := core.ScheduledTask{
-		TaskID:        "task-2",
-		ScheduleInput: core.ScheduleInput{Cron: "@every 2h", Prompt: "p", SessionMode: core.PromptRunSessionNew},
-		Enabled:       false,
-		NextRunAt:     scheduleNow.Add(2 * time.Hour),
-		RunState:      core.ScheduledRunStateRunning,
-		RunStartedAt:  scheduleNow.Add(-2 * time.Minute),
-		LastRunAt:     scheduleNow.Add(-time.Minute),
-		LastOutcome:   core.ScheduledRunRunning,
-		LastDetail:    "resumed 3f2a…",
-		CreatedAt:     scheduleNow.Add(-time.Hour),
-		UpdatedAt:     scheduleNow.Add(-30 * time.Minute),
+		TaskID:           "task-2",
+		ScheduleInput:    core.ScheduleInput{Cron: "@every 2h", Prompt: "p", SessionMode: core.PromptRunSessionNew},
+		Enabled:          false,
+		NextRunAt:        scheduleNow.Add(2 * time.Hour),
+		RunState:         core.ScheduledRunStateRunning,
+		RunStartedAt:     scheduleNow.Add(-2 * time.Minute),
+		LastRunAt:        scheduleNow.Add(-time.Minute),
+		LastOutcome:      core.ScheduledRunRunning,
+		LastDetail:       "resumed 3f2a…",
+		RunSkippedAt:     scheduleNow.Add(-30 * time.Second),
+		RunSkippedDetail: "session busy",
+		CreatedAt:        scheduleNow.Add(-time.Hour),
+		UpdatedAt:        scheduleNow.Add(-30 * time.Minute),
 	}
 	require.NoError(t, repo.CreateScheduledTask(ctx, busy))
 	require.Equal(t, busy, getSchedule(t, repo, "task-2"), "a paused schedule and its run record survive")
@@ -378,16 +380,82 @@ func TestRepositoryScheduledTasks_ResolveNeedsARunInFlightAndSetsItsDetail(t *te
 	require.Equal(t, core.ScheduledRunFailed, getSchedule(t, repo, "task-1").LastOutcome)
 }
 
-func TestRepositoryScheduledTasks_ASkipLeavesARunInFlightAlone(t *testing.T) {
+func TestRepositoryScheduledTasks_ASkipLeavesARunInFlightAloneAndIsKeptBesideIt(t *testing.T) {
 	repo := newTestRepository(t)
 	ctx := context.Background()
 	createScheduledTask(t, repo, "task-1")
 	require.NoError(t, repo.StartScheduledRun(ctx, "task-1", scheduleNow, "sent to the running session"))
 	before := getSchedule(t, repo, "task-1")
+	skippedAt := scheduleNow.Add(time.Hour)
 
+	require.NoError(t, repo.SkipScheduledRun(ctx, "task-1", skippedAt, "session busy"))
+
+	got := getSchedule(t, repo, "task-1")
+	want := before
+	want.RunSkippedAt, want.RunSkippedDetail = skippedAt, "session busy"
+	require.Equal(t, want, got, "the run's own record is as it was; the skip is beside it")
+
+	// The latest skip is the one kept.
+	require.NoError(t, repo.SkipScheduledRun(ctx, "task-1", skippedAt.Add(time.Hour), "waiting on a permission prompt"))
+	got = getSchedule(t, repo, "task-1")
+	require.Equal(t, "waiting on a permission prompt", got.RunSkippedDetail)
+	require.True(t, got.RunSkippedAt.Equal(skippedAt.Add(time.Hour)))
+
+	// The run ends, and the skip is still told of until another run begins.
+	_, err := repo.ResolveScheduledRun(ctx, "task-1", core.ScheduledRunCompleted, "")
+	require.NoError(t, err)
+	require.Equal(t, "waiting on a permission prompt", getSchedule(t, repo, "task-1").RunSkippedDetail)
+
+	require.NoError(t, repo.StartScheduledRun(ctx, "task-1", skippedAt.Add(2*time.Hour), "started fresh"))
+	got = getSchedule(t, repo, "task-1")
+	require.True(t, got.RunSkippedAt.IsZero(), "a new run is not skipped")
+	require.Empty(t, got.RunSkippedDetail)
+}
+
+func TestRepositoryScheduledTasks_ASkipWithNoRunInFlightIsTheLatestRunNotANoteBesideOne(t *testing.T) {
+	repo := newTestRepository(t)
+	ctx := context.Background()
+	createScheduledTask(t, repo, "task-1")
+	require.NoError(t, repo.StartScheduledRun(ctx, "task-1", scheduleNow, "started fresh"))
+	require.NoError(t, repo.SkipScheduledRun(ctx, "task-1", scheduleNow.Add(time.Hour), "session busy"))
+	_, err := repo.ResolveScheduledRun(ctx, "task-1", core.ScheduledRunCompleted, "")
+	require.NoError(t, err)
+
+	require.NoError(t, repo.SkipScheduledRun(ctx, "task-1", scheduleNow.Add(2*time.Hour), "session busy"))
+
+	got := getSchedule(t, repo, "task-1")
+	require.Equal(t, core.ScheduledRunSkipped, got.LastOutcome)
+	require.True(t, got.RunSkippedAt.IsZero(), "the note beside the run before is gone with it")
+	require.Empty(t, got.RunSkippedDetail)
+}
+
+func TestRepositoryScheduledTasks_AFailureForgetsTheSkipsBesideTheRunItEnds(t *testing.T) {
+	repo := newTestRepository(t)
+	ctx := context.Background()
+	createScheduledTask(t, repo, "task-1")
+	require.NoError(t, repo.StartScheduledRun(ctx, "task-1", scheduleNow, "started fresh"))
 	require.NoError(t, repo.SkipScheduledRun(ctx, "task-1", scheduleNow.Add(time.Hour), "session busy"))
 
-	require.Equal(t, before, getSchedule(t, repo, "task-1"))
+	require.NoError(t, repo.FailScheduledRun(ctx, "task-1", scheduleNow.Add(2*time.Hour), "the session ended"))
+
+	got := getSchedule(t, repo, "task-1")
+	require.True(t, got.RunSkippedAt.IsZero())
+	require.Empty(t, got.RunSkippedDetail)
+}
+
+func TestRepositoryScheduledTasks_AnEditKeepsTheSkipBesideARunInFlight(t *testing.T) {
+	repo := newTestRepository(t)
+	ctx := context.Background()
+	stored := createScheduledTask(t, repo, "task-1")
+	require.NoError(t, repo.StartScheduledRun(ctx, "task-1", scheduleNow, "started fresh"))
+	require.NoError(t, repo.SkipScheduledRun(ctx, "task-1", scheduleNow.Add(time.Hour), "session busy"))
+
+	edit := stored
+	edit.Prompt = "edited"
+	edit.UpdatedAt = scheduleNow.Add(time.Second)
+	require.NoError(t, repo.UpdateScheduledTask(ctx, edit, stored.UpdatedAt))
+
+	require.Equal(t, "session busy", getSchedule(t, repo, "task-1").RunSkippedDetail)
 }
 
 func TestRepositoryScheduledTasks_AFailureEndsARunInFlight(t *testing.T) {

@@ -127,3 +127,44 @@ func TestTaskServiceReconnectTaskSession_FailsWhenProviderSessionEnvironmentSetu
 	require.Equal(t, 1, svc.providerRepo.sessionEnvCalls)
 	require.Nil(t, svc.sessionClient.startedTask)
 }
+
+// A Scheduled task's provider is started by its runs, with the prompt and the
+// permission mode of its schedule. Opening its window after a reboot must not
+// start one with the task's own launch, which a later run would then send its
+// prompt to, under the wrong permission mode.
+func TestTaskServiceReconnectTaskSession_RecreatesAScheduledTasksSessionAsAShellWithoutItsProvider(t *testing.T) {
+	svc := newTestTaskService(t)
+	svc.taskRepo.listTasks = []*Task{{
+		ID:           "task-1",
+		Kind:         TaskKindScheduled,
+		DisplayName:  "nightly triage",
+		RepoRoot:     "/tmp/repo",
+		WorktreePath: "/tmp/repo-task",
+		TmuxSession:  "repo_task",
+		Provider:     ProviderCodex,
+	}}
+	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
+		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
+	}
+
+	err := svc.service.ReconnectTaskSession(t.Context(), "task-1")
+
+	require.NoError(t, err)
+	require.NotNil(t, svc.sessionClient.startedTask, "the session is back")
+	require.Equal(t, "task-1", svc.sessionClient.startedTask.ID)
+	require.Empty(t, svc.sessionClient.startedLaunch.Command, "a shell: the next run starts the provider")
+	require.Empty(t, svc.sessionClient.startedLaunch.PrefillInput)
+	require.Empty(t, svc.providerRepo.promptRunLaunches)
+}
+
+func TestTaskServiceReconnectTaskSession_ReportsAScheduledTasksSessionThatCannotBeRecreated(t *testing.T) {
+	svc := newTestTaskService(t)
+	svc.taskRepo.listTasks = []*Task{{
+		ID: "task-1", Kind: TaskKindScheduled, TmuxSession: "repo_task", Provider: ProviderCodex,
+	}}
+	svc.sessionClient.startErr = errors.New("tmux refused")
+
+	err := svc.service.ReconnectTaskSession(t.Context(), "task-1")
+
+	require.ErrorContains(t, err, "tmux refused")
+}

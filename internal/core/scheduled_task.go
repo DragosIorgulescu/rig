@@ -95,6 +95,11 @@ type ScheduledTask struct {
 	// was skipped or failed.
 	LastOutcome ScheduledRunOutcome `json:"last_outcome,omitempty"`
 	LastDetail  string              `json:"last_detail,omitempty"`
+	// RunSkippedAt and RunSkippedDetail say when and why the latest run due
+	// while another was in flight was skipped. That run's own record is left as
+	// it is, so the skip is kept beside it, until the next run starts.
+	RunSkippedAt     time.Time `json:"run_skipped_at,omitzero"`
+	RunSkippedDetail string    `json:"run_skipped_detail,omitempty"`
 }
 
 // IsRunning reports whether a run of the schedule is in flight.

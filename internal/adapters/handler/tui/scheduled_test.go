@@ -342,6 +342,72 @@ func TestScheduledList_RowsSayWhenTheTaskRunsNextAndHowTheLastRunWent(t *testing
 	}
 }
 
+// A run due while another is still in flight is skipped without touching the
+// record of the one in flight, so the row would say it runs and nothing of the
+// runs that were not made.
+func TestScheduledList_ARowSaysWhenARunDueDuringARunInFlightWasSkippedAndWhy(t *testing.T) {
+	running := func(s *core.ScheduledTask) {
+		s.LastOutcome, s.RunState = core.ScheduledRunRunning, core.ScheduledRunStateRunning
+		s.RunStartedAt = scheduleClock.Add(-5 * time.Minute)
+		s.RunSkippedAt, s.RunSkippedDetail = scheduleClock.Add(-time.Minute), "session busy"
+	}
+	m := scheduledList(t, scheduledFrontend(running))
+	require.Contains(t, rowText(t, m, "morning digest"), "running since 07:55 · skipped 07:59: session busy")
+
+	t.Run("a skip without a reason", func(t *testing.T) {
+		m := scheduledList(t, scheduledFrontend(func(s *core.ScheduledTask) {
+			running(s)
+			s.RunSkippedDetail = ""
+		}))
+		text := rowText(t, m, "morning digest")
+		require.Contains(t, text, "running since 07:55 · skipped 07:59")
+		require.NotContains(t, text, "skipped 07:59:")
+	})
+	t.Run("once the run has ended the row is about it alone", func(t *testing.T) {
+		m := scheduledList(t, scheduledFrontend(func(s *core.ScheduledTask) {
+			running(s)
+			s.LastOutcome, s.RunState = core.ScheduledRunCompleted, core.ScheduledRunStateIdle
+		}))
+		text := rowText(t, m, "morning digest")
+		require.Contains(t, text, "ran 07:00")
+		require.NotContains(t, text, "skipped")
+	})
+	t.Run("a run that was not skipped says nothing of it", func(t *testing.T) {
+		m := scheduledList(t, scheduledFrontend(func(s *core.ScheduledTask) {
+			running(s)
+			s.RunSkippedAt, s.RunSkippedDetail = time.Time{}, ""
+		}))
+		require.NotContains(t, rowText(t, m, "morning digest"), "skipped")
+	})
+}
+
+func TestScheduledList_DetailsSayWhenARunDueDuringARunInFlightWasSkippedAndWhy(t *testing.T) {
+	m := scheduledList(t, scheduledFrontend(func(s *core.ScheduledTask) {
+		s.LastOutcome, s.RunState = core.ScheduledRunRunning, core.ScheduledRunStateRunning
+		s.RunStartedAt = scheduleClock.Add(-5 * time.Minute)
+		s.RunSkippedAt = scheduleClock.Add(-time.Minute)
+		s.RunSkippedDetail = "waiting on a permission prompt"
+	}))
+
+	view := viewOf(send(t, m, keySpace))
+
+	_, lastRun, _ := strings.Cut(view, "LAST RUN")
+	require.Contains(t, lastRun, "skipped Sun Oct 11 07:59 · while a run was in progress")
+	require.Contains(t, lastRun, "waiting on a permission prompt")
+
+	// It stays on the panel after the run it was due beside ends.
+	m = scheduledList(t, scheduledFrontend(func(s *core.ScheduledTask) {
+		s.LastOutcome = core.ScheduledRunCompleted
+		s.RunSkippedAt, s.RunSkippedDetail = scheduleClock.Add(-time.Minute), "session busy"
+	}))
+	view = viewOf(send(t, m, keySpace))
+	require.Contains(t, view, "while a run was in progress")
+	require.Contains(t, view, "session busy")
+
+	m = scheduledList(t, scheduledFrontend(nil))
+	require.NotContains(t, viewOf(send(t, m, keySpace)), "while a run was in progress")
+}
+
 func TestScheduledList_RowsShowTheNextRunRelativeUnderADayAndByTheClockAfter(t *testing.T) {
 	cases := map[string]struct {
 		next time.Time
@@ -583,6 +649,36 @@ func TestScheduledList_RRunsTheSelectedTaskNowEvenWhenPaused(t *testing.T) {
 
 	m = send(t, m, key("j"))
 	require.NotContains(t, viewOf(m), "Run requested", "the note goes with the next key")
+}
+
+// The run is made in the daemon and its outcome shows on the row; a note that
+// stayed until a key was pressed would say a run was requested long after it
+// finished.
+func TestScheduledList_TheNoteOnARequestedRunGoesByItselfAfterAFewSeconds(t *testing.T) {
+	m := send(t, scheduledList(t, scheduledFrontend(nil)), key("r"))
+	require.Contains(t, viewOf(m), "Run requested for morning digest.")
+
+	now := scheduleClock
+	m.clock = func() time.Time { return now }
+	now = scheduleClock.Add(scheduleNoticeLifetime - time.Second)
+	next, _ := m.Update(activityRefreshTickMsg{})
+	m = asModel(t, next)
+	require.Contains(t, viewOf(m), "Run requested for morning digest.", "not yet")
+
+	now = scheduleClock.Add(scheduleNoticeLifetime)
+	next, _ = m.Update(activityRefreshTickMsg{})
+	m = asModel(t, next)
+	require.NotContains(t, viewOf(m), "Run requested")
+	require.Empty(t, m.notice)
+}
+
+func TestScheduledList_ANoteWithNoTimeSetStaysUntilAKey(t *testing.T) {
+	m := scheduledList(t, scheduledFrontend(nil))
+	m.notice = "Something went well."
+
+	next, _ := m.Update(activityRefreshTickMsg{})
+
+	require.Equal(t, "Something went well.", asModel(t, next).notice)
 }
 
 func TestScheduledList_RShowsWhyARunWasRefused(t *testing.T) {

@@ -59,7 +59,11 @@ Use `rig` for the CLI command and Rig for the product or system.
   permission prompt. Rig reads it from the window, where the Provider shows a
   marker such as "esc to interrupt" only while a turn runs, and not from the
   Provider's last hook status alone, which can stay at working after the user
-  interrupts a turn.
+  interrupts a turn, or at a permission prompt after the user dismisses it:
+  neither sends a hook. All of the window is read, since a turn draws a list of
+  todos or its subagents under the marker. A hook status that asks for a
+  permission counts only while the window still shows one of the Provider's
+  permission markers.
 - Permission mode: How freely the Provider of a Prompt run may act before it
   asks the user: `auto` (the default), `default`, `accept_edits` or `bypass`.
   Each Provider maps the mode to its own launch flags, and refuses one it
@@ -82,7 +86,10 @@ Use `rig` for the CLI command and Rig for the product or system.
   `completed`, `skipped` or `failed`, with the reason for the last two, beside
   when it ran and when the schedule fires next. A run missed because the
   daemon was down or the Task was not ready is made once, and the runs between
-  are not made up.
+  are not made up. A run whose Provider exits at launch fails with what the
+  window last said; a run in flight whose Provider is gone from the window
+  fails as the session ended. A run due while another is in flight is skipped,
+  and the skip is kept beside the run's record.
 - Scheduled list: The TUI list of Scheduled tasks, apart from the current list
   and the Shelf, which leave them out. A row shows the task's schedule, when it
   fires next and how its latest run went, and its details show the prompt in
@@ -92,6 +99,8 @@ Use `rig` for the CLI command and Rig for the product or system.
   Provider stays open in the Task's window and each run sends it the prompt,
   starting it, resuming the latest session, only when none runs there. In `new`
   each run ends whatever session is in the window and starts a fresh one.
+  Anything else in the window that is not a shell is ended before a Provider
+  is started in it.
 - Handoff note: A note the previous provider session writes, without a
   terminal on a fork that is not saved, for a new session to start from: goal,
   state, decisions, where things are, gotchas, next step. Kept under Rig's
@@ -259,7 +268,14 @@ Use `rig` for the CLI command and Rig for the product or system.
   or not, which leaves the next scheduled run as it was.
 - A Scheduled run still in flight when the daemon stops is left as it is. The
   next run finds out whether its session is Busy: if so it is skipped and the
-  record keeps saying the run is in flight; if not, the new run replaces it.
+  record keeps saying the run is in flight, with the skip beside it; if not,
+  the new run replaces it. Before that, the scheduler fails a run in flight
+  whose Provider is no longer in the window.
+- A Scheduled run belongs to the latest Provider session of its Task: the end
+  of an earlier session, which a run in `new` mode replaced, is not the run's
+  end, however late it is reported.
+- A Scheduled task's window is recreated as a shell when the user opens it
+  after its session was lost; only a Scheduled run starts the Provider there.
 - A Scheduled task is created through the composer, which chooses its Provider,
   launch options and workspace, and then a schedule step, which chooses the
   cron expression, the Session mode and the Permission mode. The daemon decides

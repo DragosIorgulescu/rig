@@ -37,11 +37,6 @@ const (
 	// Enter that submits it. A long paste takes the provider a moment to
 	// take in, and an Enter sent before it has would be part of the paste.
 	promptPasteSettleDelay = time.Second
-	// paneTailLines is how many of the last non-empty lines of a pane
-	// TaskPaneShows looks at: the provider's status line sits at the bottom of
-	// its screen, and what is above it is the conversation, which may well
-	// mention the markers.
-	paneTailLines = 10
 	// defaultRespawnTimeout bounds how long respawning a task pane waits for
 	// the processes that ran in it to exit, and defaultRespawnSettle is the
 	// pause after they have, so the old provider's SessionEnd hook cannot land
@@ -621,11 +616,13 @@ func (r *repository) DeleteTaskSession(ctx context.Context, task *core.Task) err
 	return err
 }
 
-// TaskPaneShows reports whether any of markers is among the last lines of what
-// the task's window shows now. It looks at the window's visible text only, not
-// its history, and at its last non-empty lines only, where a provider's status
-// line is. A pane that cannot be captured is an error; the caller decides what
-// that means.
+// TaskPaneShows reports whether any of markers is in what the task's window
+// shows now, without regard to case. It looks at the window's visible text
+// only, not its history, and at all of it: a provider draws its status line
+// above whatever else its turn shows, such as a list of todos or the lines of
+// the subagents at work, and the input box and footer under that, so no
+// number of its last lines holds the status line for every turn. A pane that
+// cannot be captured is an error; the caller decides what that means.
 func (r *repository) TaskPaneShows(ctx context.Context, task *core.Task, markers []string) (bool, error) {
 	if task == nil || strings.TrimSpace(task.TmuxSession) == "" {
 		return false, fmt.Errorf("task tmux session is required")
@@ -635,22 +632,11 @@ func (r *repository) TaskPaneShows(ctx context.Context, task *core.Task, markers
 		return false, err
 	}
 
-	var tail []string
-	lines := strings.Split(content, "\n")
-	for i := len(lines) - 1; i >= 0 && len(tail) < paneTailLines; i-- {
-		if line := strings.TrimSpace(lines[i]); line != "" {
-			tail = append(tail, strings.ToLower(line))
-		}
-	}
+	content = strings.ToLower(content)
 	for _, marker := range markers {
 		marker = strings.ToLower(strings.TrimSpace(marker))
-		if marker == "" {
-			continue
-		}
-		for _, line := range tail {
-			if strings.Contains(line, marker) {
-				return true, nil
-			}
+		if marker != "" && strings.Contains(content, marker) {
+			return true, nil
 		}
 	}
 	return false, nil

@@ -1187,7 +1187,7 @@ func expectCapturePane(runner *subprocess.MockRunner, target string, screen stri
 	return expectTmuxRun(runner, subprocess.Result{Stdout: screen}, nil, "capture-pane", "-t", target, "-p")
 }
 
-func TestRepositoryTaskPaneShows_FindsAMarkerInTheLastLinesOfTheTasksOwnWindow(t *testing.T) {
+func TestRepositoryTaskPaneShows_FindsAMarkerInTheTasksOwnWindow(t *testing.T) {
 	screen := "● Reading the issues\n\n✻ Pondering… (12s · esc to interrupt)\n\n╭──────╮\n│ >    │\n╰──────╯\n"
 	runner := subprocess.NewMockRunner(t)
 	repo := New(runner).(*repository)
@@ -1243,36 +1243,25 @@ func TestRepositoryTaskPaneShows_MatchesWithoutRegardToCase(t *testing.T) {
 	require.True(t, shows)
 }
 
-func TestRepositoryTaskPaneShows_OnlyLooksAtTheLastTenNonEmptyLines(t *testing.T) {
-	// The marker is the eleventh non-empty line from the bottom, as when a
-	// finished turn's text, which names it, is still on screen above the
-	// idle input box.
-	lines := []string{"the turn said: press esc to interrupt"}
-	for i := range 10 {
-		lines = append(lines, "", fmt.Sprintf("line %d", i))
+// A turn with a list of todos and subagents at work draws many lines between
+// its status line and the bottom of the window; the busy marker must be found
+// however many.
+func TestRepositoryTaskPaneShows_FindsAMarkerHoweverManyLinesAreDrawnUnderIt(t *testing.T) {
+	lines := []string{"✻ Pondering… (12s · esc to interrupt)"}
+	for i := range 12 {
+		lines = append(lines, fmt.Sprintf("  ⎿  ☐ todo %d", i))
 	}
-	tenth := append([]string{"esc to interrupt"}, lines[1:]...)
+	lines = append(lines, "  ⎿  Running 2 Task agents…", "", "╭──────╮", "│ >    │", "╰──────╯", "  ? for shortcuts")
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	expectCapturePane(runner, "=repo_task:task", strings.Join(lines, "\n")+"\n")
 
-	for name, tt := range map[string]struct {
-		screen string
-		want   bool
-	}{
-		"the eleventh line from the bottom": {strings.Join(lines, "\n") + "\n\n\n", false},
-		"the tenth line from the bottom":    {strings.Join(tenth[:len(tenth)-1], "\n") + "\n\n\n", true},
-	} {
-		t.Run(name, func(t *testing.T) {
-			runner := subprocess.NewMockRunner(t)
-			repo := New(runner).(*repository)
-			expectCapturePane(runner, "=repo_task:task", tt.screen)
+	shows, err := repo.TaskPaneShows(
+		context.Background(), &core.Task{TmuxSession: "repo_task"}, []string{"esc to interrupt"},
+	)
 
-			shows, err := repo.TaskPaneShows(
-				context.Background(), &core.Task{TmuxSession: "repo_task"}, []string{"esc to interrupt"},
-			)
-
-			require.NoError(t, err)
-			require.Equal(t, tt.want, shows)
-		})
-	}
+	require.NoError(t, err)
+	require.True(t, shows)
 }
 
 func TestRepositoryTaskPaneShows_ReturnsACaptureFailure(t *testing.T) {
