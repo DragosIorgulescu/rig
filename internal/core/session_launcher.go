@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,6 +38,12 @@ type sessionLauncher struct {
 	providerSessionLateWait time.Duration
 	// sessionPollInterval paces both waits.
 	sessionPollInterval time.Duration
+
+	// latePrefills counts, per task, how often the prompts still waiting in the
+	// background for a session start were withdrawn; a waiting prompt types
+	// itself only if its task's count is as it was when it began to wait.
+	latePrefillsMu sync.Mutex
+	latePrefills   map[string]uint64
 }
 
 func newSessionLauncher(
@@ -57,6 +64,7 @@ func newSessionLauncher(
 		providerSessionWait:     defaultProviderSessionWait,
 		providerSessionLateWait: defaultProviderSessionLateWait,
 		sessionPollInterval:     250 * time.Millisecond,
+		latePrefills:            make(map[string]uint64),
 	}
 }
 
@@ -271,7 +279,9 @@ func (l *sessionLauncher) launchSession(ctx context.Context, task *Task, reuseRu
 	// The provider has not reported its session yet, most likely a startup
 	// dialog is waiting for the user. The launch is complete; the prompt is
 	// typed once the session starts. The task record keeps it meanwhile.
-	go l.prefillWhenSessionStarts(context.WithoutCancel(ctx), task, launch, knownSessions)
+	go l.prefillWhenSessionStarts(
+		context.WithoutCancel(ctx), task, launch, knownSessions, l.latePrefillWithdrawals(task.ID),
+	)
 	return task, nil
 }
 
@@ -280,11 +290,38 @@ func (l *sessionLauncher) prefillWhenSessionStarts(
 	task *Task,
 	launch TaskSessionLaunchSpec,
 	known map[string]bool,
+	withdrawals uint64,
 ) {
 	if !l.awaitProviderSession(ctx, task, known, l.providerSessionLateWait) {
 		return
 	}
+	// Whatever started the session that arrived is not this launch's
+	// provider when the prompt was withdrawn in between.
+	if l.latePrefillWithdrawals(task.ID) != withdrawals {
+		return
+	}
 	_ = l.tmuxSession.PrefillTaskSession(ctx, task, launch)
+}
+
+// latePrefillWithdrawals is how often the task's waiting prompts were
+// withdrawn so far.
+func (l *sessionLauncher) latePrefillWithdrawals(taskID string) uint64 {
+	l.latePrefillsMu.Lock()
+	defer l.latePrefillsMu.Unlock()
+	return l.latePrefills[taskID]
+}
+
+// withdrawLatePrefill cancels the prompts a launch of the task left waiting in
+// the background for its provider's session start. They would otherwise be
+// typed into whichever provider session starts next, which another launch,
+// such as a prompt run, may have started in the window.
+func (l *sessionLauncher) withdrawLatePrefill(taskID string) {
+	l.latePrefillsMu.Lock()
+	defer l.latePrefillsMu.Unlock()
+	if l.latePrefills == nil {
+		l.latePrefills = make(map[string]uint64)
+	}
+	l.latePrefills[taskID]++
 }
 
 // providerRunning reports whether the task's pane is already running the

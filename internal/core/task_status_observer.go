@@ -74,9 +74,30 @@ func (o *taskStatusObserver) LatestTaskStatus(
 	ctx context.Context,
 	taskID string,
 ) (*TaskStatusUpdate, error) {
+	return o.latestTaskStatus(ctx, taskID, true)
+}
+
+// FreshTaskStatus is LatestTaskStatus without the cached view: it waits for a
+// new look at the persisted status and the live session. Something that acts
+// on the status, rather than shows it, cannot work from a view that is up to
+// the cache's age behind a hook event.
+func (o *taskStatusObserver) FreshTaskStatus(
+	ctx context.Context,
+	taskID string,
+) (*TaskStatusUpdate, error) {
+	return o.latestTaskStatus(ctx, taskID, false)
+}
+
+func (o *taskStatusObserver) latestTaskStatus(
+	ctx context.Context,
+	taskID string,
+	allowCached bool,
+) (*TaskStatusUpdate, error) {
 	taskID = strings.TrimSpace(taskID)
-	if cached, ok := o.freshCachedView(taskID); ok {
-		return cached, nil
+	if allowCached {
+		if cached, ok := o.freshCachedView(taskID); ok {
+			return cached, nil
+		}
 	}
 
 	waiter := make(chan taskStatusResult, 1)

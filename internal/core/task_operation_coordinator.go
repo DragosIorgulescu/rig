@@ -18,6 +18,7 @@ const (
 	taskOperationShelve        taskOperation = "shelve"
 	taskOperationUnshelve      taskOperation = "unshelve"
 	taskOperationRename        taskOperation = "rename"
+	taskOperationPromptRun     taskOperation = "prompt run"
 )
 
 func (o taskOperation) progressLabel() string {
@@ -38,6 +39,8 @@ func (o taskOperation) progressLabel() string {
 		return "being put back on the list"
 	case taskOperationRename:
 		return "being renamed"
+	case taskOperationPromptRun:
+		return "running a prompt"
 	default:
 		return "running another operation"
 	}

@@ -46,6 +46,8 @@ type fakeTaskService struct {
 	createErr   error
 
 	newSessionInput   *core.NewTaskSessionInput
+	promptRunInput    *core.RunTaskPromptInput
+	promptRunResult   core.RunTaskPromptResult
 	launchSettings    *core.LaunchSettings
 	launchSettingsEnv core.ProviderEnv
 
@@ -129,6 +131,16 @@ func (f *fakeTaskService) GetLaunchSettings(_ context.Context, env core.Provider
 	defer f.mu.Unlock()
 	f.launchSettingsEnv = env
 	return f.launchSettings, f.errByOp["get_launch_settings"]
+}
+
+func (f *fakeTaskService) RunTaskPrompt(
+	_ context.Context,
+	input core.RunTaskPromptInput,
+) (core.RunTaskPromptResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.promptRunInput = &input
+	return f.promptRunResult, f.errByOp["run_task_prompt"]
 }
 
 func (f *fakeTaskService) ListRepoPullRequests(_ context.Context, cwd string) ([]core.RepoPullRequest, error) {

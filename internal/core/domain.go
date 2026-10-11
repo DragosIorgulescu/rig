@@ -290,7 +290,13 @@ type TaskStatusUpdate struct {
 
 // TaskSessionRuntimeState is the current tmux-side state of a task session.
 type TaskSessionRuntimeState struct {
+	// ActiveCommands are the pane's foreground command and the commands of
+	// the direct child processes of its root process, the shell.
 	ActiveCommands []string
+	// ChildCommands are those direct child processes alone. A shell waiting at
+	// its prompt has none; whatever else runs in the pane, a script, an editor
+	// or a nested shell, shows up here.
+	ChildCommands []string
 	// CommandStartedAt maps the command of each pane child process to when its
 	// newest process started. Commands without a known start time, such as the
 	// pane's foreground command, are absent.
@@ -570,6 +576,54 @@ type ProviderDetection struct {
 	Provider Provider `json:"provider"`
 	Ready    bool     `json:"ready"`
 	Detail   string   `json:"detail,omitempty"`
+}
+
+// TaskPermissionMode is how freely a provider session rig starts for a
+// prompt run may act before it asks the user. Each provider maps the mode onto
+// its own flags; a provider that cannot honour one refuses it.
+type TaskPermissionMode string
+
+const (
+	// TaskPermissionModeAuto lets the provider decide, with its own safety
+	// checks, which actions need the user. It is the default.
+	TaskPermissionModeAuto TaskPermissionMode = "auto"
+	// TaskPermissionModeDefault adds no flag: the provider asks the way it
+	// does for a session the user started by hand.
+	TaskPermissionModeDefault TaskPermissionMode = "default"
+	// TaskPermissionModeAcceptEdits lets the provider edit files without
+	// asking.
+	TaskPermissionModeAcceptEdits TaskPermissionMode = "accept_edits"
+	// TaskPermissionModeBypass lets the provider do anything without asking.
+	TaskPermissionModeBypass TaskPermissionMode = "bypass"
+)
+
+// ParseTaskPermissionMode returns the permission mode name stands for; an empty
+// name is TaskPermissionModeAuto.
+func ParseTaskPermissionMode(name string) (TaskPermissionMode, error) {
+	switch mode := TaskPermissionMode(strings.TrimSpace(name)); mode {
+	case "":
+		return TaskPermissionModeAuto, nil
+	case TaskPermissionModeAuto, TaskPermissionModeDefault, TaskPermissionModeAcceptEdits, TaskPermissionModeBypass:
+		return mode, nil
+	default:
+		return "", fmt.Errorf(
+			"unknown permission mode %q: use %s, %s, %s or %s",
+			name,
+			TaskPermissionModeAuto,
+			TaskPermissionModeDefault,
+			TaskPermissionModeAcceptEdits,
+			TaskPermissionModeBypass,
+		)
+	}
+}
+
+// PromptRunLaunch is what a provider needs, beyond the Task's own launch
+// options, to start a session that runs one stored prompt.
+type PromptRunLaunch struct {
+	// ResumeSessionID is the provider session the run continues; empty starts
+	// a fresh one.
+	ResumeSessionID string
+	PermissionMode  TaskPermissionMode
 }
 
 // TaskSessionLaunchSpec is the handoff from a provider client to the tmux

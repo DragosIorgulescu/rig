@@ -38,6 +38,18 @@ type testTaskServiceHarness struct {
 	workspace             workspaceManagerState
 	providerConfigMock    *MockProviderConfigStore
 	providerConfig        providerConfigState
+	promptFilesMock       *MockPromptFileStore
+	promptFiles           promptFileState
+}
+
+type promptFileWrite struct {
+	taskID string
+	text   string
+}
+
+type promptFileState struct {
+	err    error
+	writes []promptFileWrite
 }
 
 type providerConfigState struct {
@@ -73,6 +85,11 @@ type taskRepositoryState struct {
 	latestByTask           map[string]TaskStatusUpdate
 	subscribers            map[string][]chan TaskStatusUpdate
 	subscribeCalls         map[string]int
+	// onListTasks runs at the start of every ListTasks call, with the number
+	// of calls so far including this one, for example to change a task between
+	// two reads of it.
+	onListTasks func(call int)
+	listCalls   int
 }
 
 type repoClientState struct {
@@ -105,15 +122,24 @@ type sessionClientState struct {
 	startedLaunch   TaskSessionLaunchSpec
 	prefilledLaunch TaskSessionLaunchSpec
 	prefillErr      error
+	// prefillCalls counts the prompts typed into a session; it is guarded by
+	// mu, since a late prefill types from its own goroutine.
+	prefillCalls int
 	// onStart runs when a session is started, for example to record the
 	// provider session its hooks would report.
 	onStart func(*Task)
 	// submittedInputs are the texts submitted into the task window; onSubmit
 	// runs for each, for example to make the provider leave the pane.
-	submittedInputs     []string
-	submitErr           error
-	onSubmit            func(*Task, string)
-	inspectState        TaskSessionRuntimeState
+	submittedInputs []string
+	submitErr       error
+	onSubmit        func(*Task, string)
+	inspectState    TaskSessionRuntimeState
+	// viewed is whether a tmux client shows the task's window.
+	viewed              bool
+	viewedErr           error
+	viewedChecks        int
+	closeErr            error
+	closedTasks         []*Task
 	batchInspectCalls   int
 	batchInspectActive  int
 	batchInspectMax     int
@@ -176,6 +202,18 @@ type providerClientState struct {
 	sessionEnvEnv ProviderEnv
 	listEnv       ProviderEnv
 	listLimit     int
+	// promptRunSpec, when it holds anything, is what a prompt run's launch
+	// spec is built as, whatever the request.
+	promptRunSpec     TaskSessionLaunchSpec
+	promptRunErr      error
+	promptRunLaunches []PromptRunLaunch
+	// interrupted is what the provider says of the last turn; interruptChecks
+	// are the IDs of the sessions it was asked about, and interruptedSessions
+	// the sessions as it was given them.
+	interrupted         bool
+	interruptedErr      error
+	interruptChecks     []string
+	interruptedSessions []TaskProviderSession
 }
 
 func (s *providerClientState) mockCommandName() string {
@@ -261,6 +299,7 @@ func newTestTaskService(t *testing.T) *testTaskServiceHarness {
 	h.claudeClientMock = NewMockProviderClient(t)
 	h.workspaceMock = NewMockTaskWorkspaceManager(t)
 	h.providerConfigMock = NewMockProviderConfigStore(t)
+	h.promptFilesMock = NewMockPromptFileStore(t)
 	h.providerRepo.statusRecoveryCalls = make(map[string]int)
 	h.claudeRepo.statusRecoveryCalls = make(map[string]int)
 	configureTaskRepositoryMock(h.taskRepoMock, &h.taskRepo)
@@ -271,6 +310,7 @@ func newTestTaskService(t *testing.T) *testTaskServiceHarness {
 	configureProviderClientMock(h.claudeClientMock, &h.claudeRepo)
 	configureWorkspaceManagerMock(h.workspaceMock, &h.workspace, &h.sessionClient)
 	configureProviderConfigMock(h.providerConfigMock, &h.providerConfig)
+	configurePromptFileStoreMock(h.promptFilesMock, &h.promptFiles)
 
 	h.service = NewTaskService(TaskServiceDependencies{
 		Tasks:        h.taskRepoMock,
@@ -284,6 +324,7 @@ func newTestTaskService(t *testing.T) *testTaskServiceHarness {
 		Workspace:            h.workspaceMock,
 		EnableWorkspaceSetup: true,
 		ProviderConfig:       h.providerConfigMock,
+		PromptFiles:          h.promptFilesMock,
 	})
 	h.creation = h.service.creation
 	h.launcher = h.service.launcher
@@ -296,6 +337,18 @@ func newTestTaskService(t *testing.T) *testTaskServiceHarness {
 	h.service.sessionExitPoll = time.Millisecond
 
 	return h
+}
+
+func configurePromptFileStoreMock(store *MockPromptFileStore, state *promptFileState) {
+	store.EXPECT().WritePromptFile(mock.Anything, mock.Anything).RunAndReturn(
+		func(taskID string, text string) (string, error) {
+			if state.err != nil {
+				return "", state.err
+			}
+			state.writes = append(state.writes, promptFileWrite{taskID: taskID, text: text})
+			return "/data/prompts/" + taskID + ".txt", nil
+		},
+	).Maybe()
 }
 
 func configureProviderConfigMock(store *MockProviderConfigStore, state *providerConfigState) {
@@ -468,6 +521,9 @@ func configureTmuxSessionMock(client *MockTmuxSessionClient, state *sessionClien
 				*state.events = append(*state.events, "prefill_task_session")
 			}
 			state.prefilledLaunch = launch
+			state.mu.Lock()
+			state.prefillCalls++
+			state.mu.Unlock()
 			return state.prefillErr
 		},
 	).Maybe()
@@ -524,6 +580,21 @@ func configureTmuxSessionMock(client *MockTmuxSessionClient, state *sessionClien
 				}
 			}
 			return runtimeByTask, nil
+		},
+	).Maybe()
+	client.EXPECT().TaskWindowViewed(mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, _ *Task) (bool, error) {
+			state.viewedChecks++
+			return state.viewed, state.viewedErr
+		},
+	).Maybe()
+	client.EXPECT().CloseTaskWindow(mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, task *Task) error {
+			if state.events != nil {
+				*state.events = append(*state.events, "close_task_window")
+			}
+			state.closedTasks = append(state.closedTasks, cloneTask(task))
+			return state.closeErr
 		},
 	).Maybe()
 	client.EXPECT().DeleteTaskSession(mock.Anything, mock.Anything).RunAndReturn(
@@ -605,6 +676,29 @@ func configureProviderClientMock(client *MockProviderClient, state *providerClie
 				Command:     []string{state.mockCommandName(), "resume", sessionID},
 				ReadyMarker: "›",
 			}, nil
+		},
+	).Maybe()
+	client.EXPECT().BuildPromptRunLaunchSpec(mock.Anything, mock.Anything).RunAndReturn(
+		func(_ *Task, run PromptRunLaunch) (TaskSessionLaunchSpec, error) {
+			state.promptRunLaunches = append(state.promptRunLaunches, run)
+			if state.promptRunErr != nil {
+				return TaskSessionLaunchSpec{}, state.promptRunErr
+			}
+			if hasCustomLaunchSpec(state.promptRunSpec) {
+				return state.promptRunSpec, nil
+			}
+			command := []string{state.mockCommandName()}
+			if run.ResumeSessionID != "" {
+				command = append(command, "--resume", run.ResumeSessionID)
+			}
+			return TaskSessionLaunchSpec{Command: command, ReadyMarker: "›"}, nil
+		},
+	).Maybe()
+	client.EXPECT().LastTurnInterrupted(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, _ *Task, session TaskProviderSession) (bool, error) {
+			state.interruptChecks = append(state.interruptChecks, session.ProviderSessionID)
+			state.interruptedSessions = append(state.interruptedSessions, session)
+			return state.interrupted, state.interruptedErr
 		},
 	).Maybe()
 	client.EXPECT().TaskSessionCommandName().RunAndReturn(state.mockCommandName).Maybe()
@@ -836,6 +930,13 @@ func configureTaskRepositoryMock(repo *MockTaskRepository, state *taskRepository
 	).Maybe()
 	repo.EXPECT().ListTasks(mock.Anything).RunAndReturn(
 		func(context.Context) ([]*Task, error) {
+			if state.onListTasks != nil {
+				state.mu.Lock()
+				state.listCalls++
+				call := state.listCalls
+				state.mu.Unlock()
+				state.onListTasks(call)
+			}
 			if state.listErr != nil {
 				return nil, state.listErr
 			}

@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -32,6 +33,13 @@ const (
 	rigLastSessionOption = "@rig_last_session"
 	// rigFolderOption, set on a rig's own session, is the folder it runs for.
 	rigFolderOption = "@rig_folder"
+	// defaultCloseWindowTimeout bounds how long closing a task window waits
+	// for the processes that ran in it to exit, and defaultCloseWindowSettle
+	// is the pause after they have, so the old provider's SessionEnd hook
+	// cannot land after the hooks of the session that replaces it.
+	defaultCloseWindowTimeout = 15 * time.Second
+	defaultCloseWindowSettle  = 2 * time.Second
+	closeWindowPollInterval   = 100 * time.Millisecond
 )
 
 type repository struct {
@@ -39,6 +47,10 @@ type repository struct {
 	now    func() time.Time
 	sleep  func(time.Duration)
 	getenv func(string) string
+	// closeWindowTimeout and closeWindowSettle override the defaults of
+	// CloseTaskWindow's wait; zero keeps the default.
+	closeWindowTimeout time.Duration
+	closeWindowSettle  time.Duration
 }
 
 func New(runner subprocess.Runner) core.TmuxSessionClient {
@@ -308,7 +320,8 @@ func (r *repository) InspectTaskSession(ctx context.Context, task *core.Task) (c
 		"-F",
 		"#{pane_current_command}\t#{pane_pid}",
 	)
-	if isMissingSessionError(err, result) {
+	// With no tmux server there is no session either, as after a reboot.
+	if isMissingSessionError(err, result) || isNoTmuxServerError(err, result) {
 		return core.TaskSessionRuntimeState{}, nil
 	}
 	if err != nil {
@@ -324,6 +337,7 @@ func (r *repository) InspectTaskSession(ctx context.Context, task *core.Task) (c
 	return core.TaskSessionRuntimeState{
 		Exists:                          true,
 		ActiveCommands:                  append(commands, processCommands(children)...),
+		ChildCommands:                   processCommands(children),
 		CommandStartedAt:                processCommandStartTimes(children),
 		ChildProcessEvidenceUnavailable: !childEvidenceAvailable,
 	}, nil
@@ -423,6 +437,7 @@ func (r *repository) InspectTaskSessions(
 			states[taskID] = core.TaskSessionRuntimeState{
 				Exists:                          true,
 				ActiveCommands:                  append([]string(nil), activeCommands...),
+				ChildCommands:                   processCommands(children),
 				CommandStartedAt:                processCommandStartTimes(children),
 				ChildProcessEvidenceUnavailable: !childEvidenceAvailable,
 			}
@@ -510,8 +525,53 @@ func parseProcessElapsedTime(raw string) (time.Duration, bool) {
 	return time.Duration(days)*24*time.Hour + time.Duration(seconds)*time.Second, true
 }
 
+// processTree returns rootPIDs and every process descended from them, as ps
+// reports them now. It falls back to rootPIDs when the process list is
+// unavailable.
+func (r *repository) processTree(ctx context.Context, rootPIDs []string) []string {
+	tree := slices.Clone(rootPIDs)
+	if len(rootPIDs) == 0 {
+		return tree
+	}
+	result, err := r.runner.Run(ctx, "", "ps", "-axo", "pid=,ppid=")
+	if err != nil {
+		return tree
+	}
+
+	childrenOf := make(map[string][]string)
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			childrenOf[fields[1]] = append(childrenOf[fields[1]], fields[0])
+		}
+	}
+	seen := make(map[string]bool, len(tree))
+	for _, pid := range tree {
+		seen[pid] = true
+	}
+	for i := 0; i < len(tree); i++ {
+		for _, child := range childrenOf[tree[i]] {
+			if !seen[child] {
+				seen[child] = true
+				tree = append(tree, child)
+			}
+		}
+	}
+	return tree
+}
+
+// runningProcesses returns those of pids that still exist.
+func (r *repository) runningProcesses(ctx context.Context, pids []string) []string {
+	if len(pids) == 0 {
+		return nil
+	}
+	// ps exits non-zero when none of the processes exist.
+	result, _ := r.runner.Run(ctx, "", "ps", "-o", "pid=", "-p", strings.Join(pids, ","))
+	return strings.Fields(result.Stdout)
+}
+
 func processCommands(processes []paneChildProcess) []string {
-	commands := make([]string, 0, len(processes))
+	var commands []string
 	for _, process := range processes {
 		commands = append(commands, process.command)
 	}
@@ -552,6 +612,83 @@ func (r *repository) DeleteTaskSession(ctx context.Context, task *core.Task) err
 	}
 
 	return err
+}
+
+// TaskWindowViewed reports whether a tmux client is showing the task's window:
+// a client of the task's session whose current window is the task's.
+func (r *repository) TaskWindowViewed(ctx context.Context, task *core.Task) (bool, error) {
+	if task == nil || strings.TrimSpace(task.TmuxSession) == "" {
+		return false, nil
+	}
+
+	result, err := r.runner.Run(ctx, "", "tmux", "list-clients", "-F", "#{session_name}\t#{window_name}")
+	if isNoTmuxServerError(err, result) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	session := normalizedSessionName(strings.TrimSpace(task.TmuxSession))
+	window := windowOf(task)
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		clientSession, clientWindow, ok := strings.Cut(strings.TrimSuffix(line, "\r"), "\t")
+		if ok && strings.TrimSpace(clientSession) == session && strings.TrimSpace(clientWindow) == window {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// CloseTaskWindow kills the task's window, never its session, which also holds
+// the editor window and the task's child windows, and waits for the processes
+// that ran in the window to exit. The processes are noted before the kill:
+// once the pane's shell is gone, what it started is reparented and can no
+// longer be found as its children.
+func (r *repository) CloseTaskWindow(ctx context.Context, task *core.Task) error {
+	if task == nil || strings.TrimSpace(task.TmuxSession) == "" {
+		return nil
+	}
+	target := exactWindowTarget(task.TmuxSession, windowOf(task))
+
+	result, err := r.runner.Run(ctx, "", "tmux", "list-panes", "-t", target, "-F", "#{pane_pid}")
+	if isMissingSessionError(err, result) || isNoTmuxServerError(err, result) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	panePIDs := strings.Fields(result.Stdout)
+	processes := r.processTree(ctx, panePIDs)
+
+	result, err = r.runner.Run(ctx, "", "tmux", "kill-window", "-t", target)
+	if isMissingSessionError(err, result) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	timeout := cmp.Or(r.closeWindowTimeout, defaultCloseWindowTimeout)
+	deadline := r.now().Add(timeout)
+	for {
+		alive := r.runningProcesses(ctx, processes)
+		// A cancelled context also makes ps fail, which reads as no process.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(alive) == 0 {
+			break
+		}
+		if !r.now().Before(deadline) {
+			return fmt.Errorf("processes %s of the closed task window did not exit within %s",
+				strings.Join(alive, ", "), timeout)
+		}
+		r.sleep(closeWindowPollInterval)
+	}
+
+	r.sleep(cmp.Or(r.closeWindowSettle, defaultCloseWindowSettle))
+	return nil
 }
 
 func (r *repository) createSession(
@@ -669,17 +806,37 @@ func (r *repository) sendKeysToWindow(ctx context.Context, session, window strin
 	return err
 }
 
-// quoteShellCommand quotes the command words that need it for the shell.
+// quoteShellCommand quotes the command words that need it for the shell: any
+// word with a character the shell treats specially, such as a space, a quote,
+// a "$" or a parenthesis, and a word that starts with "=", which zsh expands
+// to the path of a command.
 func quoteShellCommand(command []string) []string {
 	quoted := make([]string, 0, len(command))
 	for _, part := range command {
-		if part == "" || strings.ContainsRune(part, ' ') {
+		if needsShellQuoting(part) {
 			quoted = append(quoted, "'"+strings.ReplaceAll(part, "'", "'\\''")+"'")
 			continue
 		}
 		quoted = append(quoted, part)
 	}
 	return quoted
+}
+
+// needsShellQuoting reports whether a word is empty or holds a character
+// outside [A-Za-z0-9_./:=@%+,-], the characters no shell treats specially in
+// the middle of a word.
+func needsShellQuoting(word string) bool {
+	if word == "" || strings.HasPrefix(word, "=") {
+		return true
+	}
+	return strings.ContainsFunc(word, func(r rune) bool {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return false
+		default:
+			return !strings.ContainsRune("_./:=@%+,-", r)
+		}
+	})
 }
 
 func (r *repository) capturePaneContent(ctx context.Context, session, window string) (string, error) {
@@ -878,6 +1035,9 @@ func isMissingSessionError(err error, result subprocess.Result) bool {
 		strings.Contains(lower, "can't find pane")
 }
 
+// isNoTmuxServerError reports whether a tmux failure means there is no tmux
+// server to answer: none is running, its socket does not exist (the state
+// after a reboot or logout), or nothing listens on the socket any more.
 func isNoTmuxServerError(err error, result subprocess.Result) bool {
 	if err == nil {
 		return false
@@ -889,5 +1049,9 @@ func isNoTmuxServerError(err error, result subprocess.Result) bool {
 			stderr = strings.ToLower(strings.TrimSpace(commandErr.Stderr))
 		}
 	}
-	return strings.Contains(stderr, "no server running")
+	if strings.Contains(stderr, "no server running") {
+		return true
+	}
+	return strings.Contains(stderr, "error connecting to") &&
+		(strings.Contains(stderr, "no such file or directory") || strings.Contains(stderr, "connection refused"))
 }

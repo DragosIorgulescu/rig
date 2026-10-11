@@ -114,3 +114,66 @@ func TestRepository_QuitsWithSlashQuit(t *testing.T) {
 
 	require.Equal(t, "/quit", repo.ExitCommand())
 }
+
+func TestRepositoryBuildPromptRunLaunchSpec_MapsEveryPermissionModeFreshAndResumed(t *testing.T) {
+	codexHome := t.TempDir()
+	repo := New(subprocess.NewMockRunner(t), Config{Binary: "codex"}, HookForwardingConfig{}).(*repository)
+	repo.codexHomeDir = func() (string, error) { return codexHome, nil }
+	task := &core.Task{Model: "gpt-5", Effort: "high"}
+	base := []string{"env", "CODEX_HOME=" + codexHome, "codex", "-m", "gpt-5", "-c", "model_reasoning_effort=high"}
+
+	tests := []struct {
+		mode core.TaskPermissionMode
+		flag []string
+	}{
+		{core.TaskPermissionModeAuto, []string{"--full-auto"}},
+		{core.TaskPermissionModeBypass, []string{"--dangerously-bypass-approvals-and-sandbox"}},
+		{core.TaskPermissionModeDefault, nil},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.mode)+" fresh", func(t *testing.T) {
+			launch, err := repo.BuildPromptRunLaunchSpec(task, core.PromptRunLaunch{PermissionMode: tt.mode})
+
+			require.NoError(t, err)
+			require.Equal(t, append(append([]string(nil), base...), tt.flag...), launch.Command)
+			require.Empty(t, launch.PrefillInput, "the prompt is the caller's to append, never typed")
+		})
+		t.Run(string(tt.mode)+" resumed", func(t *testing.T) {
+			launch, err := repo.BuildPromptRunLaunchSpec(task, core.PromptRunLaunch{
+				ResumeSessionID: " sess-1 ",
+				PermissionMode:  tt.mode,
+			})
+
+			require.NoError(t, err)
+			want := append(append(append([]string(nil), base...), tt.flag...), "resume", "sess-1")
+			require.Equal(t, want, launch.Command, "global flags come before the subcommand")
+		})
+	}
+}
+
+func TestRepositoryBuildPromptRunLaunchSpec_RefusesWhatCodexCannotDo(t *testing.T) {
+	repo := New(subprocess.NewMockRunner(t), Config{Binary: "codex"}, HookForwardingConfig{}).(*repository)
+	repo.codexHomeDir = func() (string, error) { return t.TempDir(), nil }
+
+	for _, resume := range []string{"", "sess-1"} {
+		_, err := repo.BuildPromptRunLaunchSpec(&core.Task{}, core.PromptRunLaunch{
+			ResumeSessionID: resume,
+			PermissionMode:  core.TaskPermissionModeAcceptEdits,
+		})
+		require.ErrorContains(t, err, "not supported by codex")
+	}
+
+	_, err := repo.BuildPromptRunLaunchSpec(&core.Task{}, core.PromptRunLaunch{PermissionMode: "yolo"})
+	require.ErrorContains(t, err, "unknown permission mode")
+}
+
+func TestRepositoryLastTurnInterrupted_IsNeverTrue(t *testing.T) {
+	repo := New(subprocess.NewMockRunner(t), Config{Binary: "codex"}, HookForwardingConfig{}).(*repository)
+
+	got, err := repo.LastTurnInterrupted(
+		context.Background(), &core.Task{}, core.TaskProviderSession{ProviderSessionID: "sess-1"},
+	)
+
+	require.NoError(t, err)
+	require.False(t, got)
+}

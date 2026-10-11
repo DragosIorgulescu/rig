@@ -44,6 +44,21 @@ Use `rig` for the CLI command and Rig for the product or system.
   another purpose. It happens in Rig, or by renaming the Task's provider
   session, whose new title the Task takes. A rename drops the Task's original
   ask, so new sessions are not briefed on what it was first for.
+- Prompt run: Starting a Task's Provider on a stored prompt, in a fresh
+  Provider session or the Task's latest one, without the user opening the
+  Task. The prompt is kept in a file under Rig's data dir and is the last
+  argument of the Provider's launch command, so nothing is typed into the
+  Provider. A run is started with `rig schedule try` for now. It is skipped,
+  never forced, while the Task is busy: another Task operation is running, the
+  user is viewing its window, its Provider is working or waiting on a
+  permission prompt, or something other than a shell is in its window. An idle
+  Provider session in the window is closed first. A run does not change the
+  Task record, and does not wait for the Provider to finish.
+- Permission mode: How freely the Provider of a Prompt run may act before it
+  asks the user: `auto` (the default), `default`, `accept_edits` or `bypass`.
+  Each Provider maps the mode to its own launch flags, and refuses one it
+  cannot honour, such as `accept_edits` for Codex. It is chosen per run and
+  not kept on the Task.
 - Handoff note: A note the previous provider session writes, without a
   terminal on a fork that is not saved, for a new session to start from: goal,
   state, decisions, where things are, gotchas, next step. Kept under Rig's
@@ -189,6 +204,14 @@ Use `rig` for the CLI command and Rig for the product or system.
   renames its Task only when the title the user gave it changes, so a Rename
   made in Rig stands until the session is renamed again. Only the Active
   provider's sessions rename the Task.
+- A Prompt run is a Task operation: it holds the Task's operation lock until
+  the Provider has taken the prompt, and a Task with another Task operation
+  running, a Prompt run still starting included, is skipped. It launches the
+  Task's Active provider with the Task's launch options and Provider
+  configuration, and never changes any of them.
+- A Prompt run in the same session resumes the Task's latest Provider session
+  only when it belongs to the Task's Active provider; otherwise it starts a
+  fresh one.
 - A Handoff note is written by the Task's latest Provider session of its
   Active provider, and only by a Provider that supports it, whichever Provider
   the new session starts with.
@@ -220,5 +243,7 @@ Use `rig` for the CLI command and Rig for the product or system.
 - Prefer "provider" for Codex or other future AI runtimes.
 - Keep durable task fields separate from live runtime observations in design
   discussions.
+- Use "prompt run" only for starting a Task's Provider on a stored prompt; the
+  work it does is still the Task's.
 - Use "daemon" for the background process and "TUI" for the foreground
   terminal interface.

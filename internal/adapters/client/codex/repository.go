@@ -289,6 +289,46 @@ func (r *repository) BuildTaskSessionLaunchSpec(task *core.Task) (core.TaskSessi
 	}, nil
 }
 
+// BuildPromptRunLaunchSpec is the interactive launch with the prompt left off:
+// the caller appends it after the subcommand, which codex takes as the first
+// message of the session. The permission mode and launch options are global
+// flags, so they come before "resume".
+func (r *repository) BuildPromptRunLaunchSpec(
+	task *core.Task,
+	run core.PromptRunLaunch,
+) (core.TaskSessionLaunchSpec, error) {
+	args := launchArgs(task)
+	switch run.PermissionMode {
+	case core.TaskPermissionModeAuto:
+		args = append(args, "--full-auto")
+	case core.TaskPermissionModeBypass:
+		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+	case core.TaskPermissionModeDefault:
+	case core.TaskPermissionModeAcceptEdits:
+		return core.TaskSessionLaunchSpec{}, fmt.Errorf(
+			"permission mode %q is not supported by codex",
+			run.PermissionMode,
+		)
+	default:
+		return core.TaskSessionLaunchSpec{}, fmt.Errorf("unknown permission mode %q", run.PermissionMode)
+	}
+	if sessionID := strings.TrimSpace(run.ResumeSessionID); sessionID != "" {
+		args = append(args, "resume", sessionID)
+	}
+
+	command, err := r.codexTaskCommand(task.ProviderEnv, args...)
+	if err != nil {
+		return core.TaskSessionLaunchSpec{}, err
+	}
+	return core.TaskSessionLaunchSpec{Command: command, ReadyMarker: readyMarker}, nil
+}
+
+// LastTurnInterrupted is always false: rig reads no interruption marker from
+// Codex sessions, so a Codex status that says working is trusted.
+func (r *repository) LastTurnInterrupted(context.Context, *core.Task, core.TaskProviderSession) (bool, error) {
+	return false, nil
+}
+
 func (r *repository) BuildReconnectTaskSessionLaunchSpec(
 	task *core.Task,
 	sessionID string,

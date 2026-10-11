@@ -15,5 +15,6 @@ docs/superpowers/*
 .codex/
 .claude/
 !CLAUDE.md
-rig
+/rig
+/cmd/rig/rig
 .agents

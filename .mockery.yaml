@@ -23,6 +23,7 @@ packages:
       TmuxSessionClient:
       ProviderClient:
       ProviderConfigStore:
+      PromptFileStore:
   github.com/BaronBonet/rig/internal/pkg/subprocess:
     interfaces:
       Runner:

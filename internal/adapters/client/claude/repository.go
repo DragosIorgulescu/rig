@@ -273,6 +273,48 @@ func (r *repository) BuildTaskSessionLaunchSpec(task *core.Task) (core.TaskSessi
 	}, nil
 }
 
+// permissionModeArgs are the flags a prompt run's permission mode adds to
+// claude.
+func permissionModeArgs(mode core.TaskPermissionMode) ([]string, error) {
+	switch mode {
+	case core.TaskPermissionModeAuto:
+		return []string{"--permission-mode", "auto"}, nil
+	case core.TaskPermissionModeAcceptEdits:
+		return []string{"--permission-mode", "acceptEdits"}, nil
+	case core.TaskPermissionModeBypass:
+		return []string{"--permission-mode", "bypassPermissions"}, nil
+	case core.TaskPermissionModeDefault:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unknown permission mode %q", mode)
+	}
+}
+
+// BuildPromptRunLaunchSpec is the interactive launch with the prompt left
+// off: the caller appends it as the last argument, which claude takes as the
+// first message of the session. Resuming adds --resume, as a reconnect does.
+func (r *repository) BuildPromptRunLaunchSpec(
+	task *core.Task,
+	run core.PromptRunLaunch,
+) (core.TaskSessionLaunchSpec, error) {
+	modeArgs, err := permissionModeArgs(run.PermissionMode)
+	if err != nil {
+		return core.TaskSessionLaunchSpec{}, err
+	}
+
+	command := []string{r.binary}
+	if sessionID := strings.TrimSpace(run.ResumeSessionID); sessionID != "" {
+		command = append(command, "--resume", sessionID)
+	}
+	command = append(command, launchArgs(task)...)
+	command = append(command, modeArgs...)
+
+	return core.TaskSessionLaunchSpec{
+		Command:     providerkit.EnvCommand(task.ProviderEnv, ConfigEnvVars, command),
+		ReadyMarker: readyMarker,
+	}, nil
+}
+
 // imageExtensions are the file types Claude Code attaches as images when
 // their paths are pasted.
 var imageExtensions = []string{".png", ".jpg", ".jpeg", ".gif", ".webp"}

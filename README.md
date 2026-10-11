@@ -499,6 +499,61 @@ so new sessions are not briefed on what the task was first for; they start
 from the handoff note and the workspace. Only the name changes: the branch,
 worktree and tmux session keep theirs.
 
+## Prompt runs (preview)
+
+A prompt run starts a task's provider on a stored prompt without you opening
+the task, in a fresh session or its latest one. Scheduling is built on it; for
+now you start one by hand to see what it would do:
+
+```sh
+rig schedule try billing-retry-flow "triage the open issues"
+rig schedule try 1760000000123 --mode same --permission accept-edits --prompt-file ./prompt.md
+```
+
+The task is named by its ID or its slug, which must match exactly one task.
+`--mode new` (the default) starts a fresh session; `--mode same` resumes the
+task's latest session, or starts a fresh one when it has none. `--permission`
+chooses how freely the provider may act before it asks you: `auto` (the
+default), `default`, `accept-edits` or `bypass`. Claude Code gets
+`--permission-mode auto`, `acceptEdits` or `bypassPermissions`, and nothing for
+`default`; Codex gets `--full-auto` or `--dangerously-bypass-approvals-and-sandbox`,
+and nothing for `default`. Codex has no `accept-edits` and refuses it.
+
+Rig writes the prompt to `prompts/<task id>.txt` in its data dir (readable by
+you alone, replaced on each run) and starts the provider in the task's own tmux
+window with the prompt as its last argument, so nothing is typed into it. The
+prompt reaches the provider exactly as written, down to the newlines it ends
+with, and may be at most 96 KiB. A prompt that starts with `-` is read as a flag
+unless it comes after `--` (`rig schedule try billing-retry-flow -- "- fix it"`)
+or is given with `--prompt-file`.
+
+The command returns once the provider has taken the prompt, or after 20 seconds
+if it has not reported yet (a startup dialog, for example, holds it up); until
+then the task counts as busy for every other run and rig operation. It does not
+wait for the run to finish, and it leaves the task's provider, model and effort
+alone: the run uses the ones the task already has.
+
+A run never interrupts you or the task. It prints `launched` with how it
+started, or `skipped` with the reason, and a skip is not an error. It skips
+when:
+
+- the task is still being created, failed, or on the shelf (a task that does
+  not exist is an error from the command, since it cannot find it);
+- another rig operation is running on the task, a run that is still starting
+  included;
+- you are viewing the task's window (a tmux client is showing it);
+- anything but an idle shell or the task's provider is running in the window:
+  an editor or dev server (`pane is running vim`), a script or a nested shell
+  the shell started (`pane is running sh`), or something rig cannot see;
+- the provider is still working, including in the background;
+- the provider is waiting on a permission prompt;
+- the task's status is one rig does not know how to act on.
+
+A provider that is idle (its turn ended, it just started, or, for Claude Code,
+you interrupted its turn with `esc`) is closed first: rig closes that one tmux
+window, never the session, so the editor window and any other sessions of the
+task stay, and starts the run in a new window.
+
 ## Switching Providers
 
 Each task row and the detail panel show the task's active provider. Press `p`

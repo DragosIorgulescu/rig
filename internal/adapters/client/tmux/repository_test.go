@@ -3,6 +3,9 @@ package tmux
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -570,6 +573,87 @@ func TestRepositoryInspectTaskSession_ReturnsActiveTaskWindowCommands(t *testing
 	require.NoError(t, err)
 	require.True(t, state.Exists)
 	require.Equal(t, []string{"zsh", "codex", "codex"}, state.ActiveCommands)
+	require.Equal(t, []string{"codex"}, state.ChildCommands, "what the pane shell started, apart from the pane's own")
+}
+
+func TestRepositoryInspectTaskSession_AShellAtItsPromptHasNoChildCommands(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	expectTmuxRun(runner, subprocess.Result{Stdout: "zsh\t100\n"}, nil,
+		"list-panes", "-t", "=repo_task:task", "-F", "#{pane_current_command}\t#{pane_pid}")
+	runner.On("Run", mock.Anything, "", "ps", "-axo", "ppid=,etime=,comm=").
+		Return(subprocess.Result{Stdout: "  999 00:10 vim\n"}, nil).Once()
+
+	state, err := repo.InspectTaskSession(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"zsh"}, state.ActiveCommands)
+	require.Empty(t, state.ChildCommands)
+}
+
+func TestRepositoryInspectTaskSession_AScriptRunByTheShellIsAChildCommandWhateverItIsCalled(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	// "sh deploy.sh" is the pane's foreground command and the shell's child.
+	expectTmuxRun(runner, subprocess.Result{Stdout: "sh\t100\n"}, nil,
+		"list-panes", "-t", "=repo_task:task", "-F", "#{pane_current_command}\t#{pane_pid}")
+	runner.On("Run", mock.Anything, "", "ps", "-axo", "ppid=,etime=,comm=").
+		Return(subprocess.Result{Stdout: "  100 00:10 sh\n"}, nil).Once()
+
+	state, err := repo.InspectTaskSession(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"sh", "sh"}, state.ActiveCommands)
+	require.Equal(t, []string{"sh"}, state.ChildCommands)
+}
+
+func TestRepositoryInspectTaskSession_NoTmuxServerMeansNoSession(t *testing.T) {
+	for name, stderr := range map[string]string{
+		"no server running": "no server running on /private/tmp/tmux-501/default",
+		"no socket":         "error connecting to /private/tmp/tmux-501/default (No such file or directory)",
+		"stale socket":      "error connecting to /private/tmp/tmux-501/default (Connection refused)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := subprocess.NewMockRunner(t)
+			repo := New(runner).(*repository)
+			expectTmuxRun(runner, subprocess.Result{Stderr: stderr}, errors.New("exit status 1"),
+				"list-panes", "-t", "=repo_task:task", "-F", "#{pane_current_command}\t#{pane_pid}")
+
+			state, err := repo.InspectTaskSession(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+			require.NoError(t, err)
+			require.Equal(t, core.TaskSessionRuntimeState{}, state)
+		})
+	}
+}
+
+func TestRepositoryInspectTaskSession_OtherTmuxFailuresAreErrors(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	expectTmuxRun(runner,
+		subprocess.Result{Stderr: "error connecting to /private/tmp/tmux-501/default (Permission denied)"},
+		errors.New("exit status 1"),
+		"list-panes", "-t", "=repo_task:task", "-F", "#{pane_current_command}\t#{pane_pid}")
+
+	_, err := repo.InspectTaskSession(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+	require.ErrorContains(t, err, "exit status 1")
+}
+
+func TestRepositoryInspectTaskSessions_NoSocketMeansNoSessions(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	expectTmuxRun(
+		runner,
+		subprocess.Result{Stderr: "error connecting to /private/tmp/tmux-501/default (No such file or directory)"},
+		errors.New("exit status 1"),
+		"list-panes", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_current_command}\t#{pane_pid}",
+	)
+
+	states, err := repo.InspectTaskSessions(context.Background(), []*core.Task{{ID: "task-1", TmuxSession: "repo_one"}})
+
+	require.NoError(t, err)
+	require.Equal(t, map[string]core.TaskSessionRuntimeState{"task-1": {}}, states)
 }
 
 func TestRepositoryInspectTaskSessions_SixTasksUseOneTmuxAndOneProcessInventory(t *testing.T) {
@@ -604,6 +688,7 @@ func TestRepositoryInspectTaskSessions_SixTasksUseOneTmuxAndOneProcessInventory(
 		"task-1": {
 			Exists:           true,
 			ActiveCommands:   []string{"zsh", "codex"},
+			ChildCommands:    []string{"codex"},
 			CommandStartedAt: map[string]time.Time{"codex": now.Add(-90 * time.Second)},
 		},
 		"task-2": {Exists: true, ActiveCommands: []string{"codex"}},
@@ -643,6 +728,7 @@ func TestRepositoryInspectTaskSessions_ReportsPaneChildProcessStartTimes(t *test
 	require.Equal(t, core.TaskSessionRuntimeState{
 		Exists:         true,
 		ActiveCommands: []string{"zsh", "codex", "codex", "ChatGPT Helper", "tail"},
+		ChildCommands:  []string{"codex", "codex", "ChatGPT Helper", "tail"},
 		CommandStartedAt: map[string]time.Time{
 			"codex":          now.Add(-5 * time.Second),
 			"ChatGPT Helper": now.Add(-12 * time.Minute),
@@ -1049,4 +1135,430 @@ func TestRepositoryInspectTaskSessions_TellsAChildTasksWindowFromItsParents(t *t
 	require.Contains(t, states["task-2"].CommandStartedAt, "claude", "its provider's start time stays with its window")
 	require.Empty(t, states["task-1"].CommandStartedAt)
 	require.False(t, states["task-3"].Exists, "a window that is gone")
+}
+
+func TestRepositoryTaskWindowViewed_IsTrueWhenAClientShowsTheTasksWindow(t *testing.T) {
+	task := &core.Task{TmuxSession: "repo_task"}
+	clients := "rig\ttask\nrepo_task\tbilling\nrepo_task\ttask\n"
+
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	expectTmuxRun(runner, subprocess.Result{Stdout: clients}, nil,
+		"list-clients", "-F", "#{session_name}\t#{window_name}",
+	)
+
+	viewed, err := repo.TaskWindowViewed(context.Background(), task)
+
+	require.NoError(t, err)
+	require.True(t, viewed)
+}
+
+func TestRepositoryTaskWindowViewed_TellsAChildTasksWindowFromItsParents(t *testing.T) {
+	parent := &core.Task{TmuxSession: "repo_task"}
+	child := &core.Task{TmuxSession: "repo_task", TmuxWindow: "s2"}
+
+	tests := []struct {
+		name    string
+		clients string
+		task    *core.Task
+		want    bool
+	}{
+		{"child's window shown", "repo_task\ts2\n", child, true},
+		{"parent's window shown, asked of the child", "repo_task\ttask\n", child, false},
+		{"child's window shown, asked of the parent", "repo_task\ts2\n", parent, false},
+		{"the editor window shown", "repo_task\teditor\n", parent, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := subprocess.NewMockRunner(t)
+			repo := New(runner).(*repository)
+			expectTmuxRun(runner, subprocess.Result{Stdout: tt.clients}, nil,
+				"list-clients", "-F", "#{session_name}\t#{window_name}",
+			)
+
+			viewed, err := repo.TaskWindowViewed(context.Background(), tt.task)
+
+			require.NoError(t, err)
+			require.Equal(t, tt.want, viewed)
+		})
+	}
+}
+
+func TestRepositoryTaskWindowViewed_IsFalseWhenNoClientShowsIt(t *testing.T) {
+	for name, stdout := range map[string]string{
+		"no clients":                     "",
+		"another session":                "other_task\ttask\n",
+		"a session with a shared prefix": "repo_task_2\ttask\n",
+		"a window with a shared prefix":  "repo_task\ttask-2\n",
+		"a malformed line":               "repo_task task\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := subprocess.NewMockRunner(t)
+			repo := New(runner).(*repository)
+			expectTmuxRun(runner, subprocess.Result{Stdout: stdout}, nil,
+				"list-clients", "-F", "#{session_name}\t#{window_name}",
+			)
+
+			viewed, err := repo.TaskWindowViewed(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+			require.NoError(t, err)
+			require.False(t, viewed)
+		})
+	}
+}
+
+func TestRepositoryTaskWindowViewed_NoServerMeansNobodyIsViewing(t *testing.T) {
+	for name, stderr := range map[string]string{
+		"no server running": "no server running on /private/tmp/tmux-501/default",
+		"no socket":         "error connecting to /private/tmp/tmux-501/default (No such file or directory)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := subprocess.NewMockRunner(t)
+			repo := New(runner).(*repository)
+			expectTmuxRun(runner, subprocess.Result{Stderr: stderr}, errors.New("exit status 1"),
+				"list-clients", "-F", "#{session_name}\t#{window_name}",
+			)
+
+			viewed, err := repo.TaskWindowViewed(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+			require.NoError(t, err)
+			require.False(t, viewed)
+		})
+	}
+}
+
+func TestRepositoryTaskWindowViewed_ReturnsOtherTmuxFailures(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	expectTmuxRun(runner, subprocess.Result{Stderr: "protocol version mismatch"}, errors.New("exit status 1"),
+		"list-clients", "-F", "#{session_name}\t#{window_name}",
+	)
+
+	_, err := repo.TaskWindowViewed(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+	require.ErrorContains(t, err, "exit status 1")
+}
+
+func TestRepositoryTaskWindowViewed_AskingAboutNoSessionAsksTmuxNothing(t *testing.T) {
+	repo := New(subprocess.NewMockRunner(t)).(*repository)
+
+	for _, task := range []*core.Task{nil, {}} {
+		viewed, err := repo.TaskWindowViewed(context.Background(), task)
+
+		require.NoError(t, err)
+		require.False(t, viewed)
+	}
+}
+
+// fakeClock makes the repository's waits instant and advances its clock by
+// what it slept.
+func fakeClock(repo *repository) *[]time.Duration {
+	now := time.Unix(1_000, 0)
+	var slept []time.Duration
+	repo.now = func() time.Time { return now }
+	repo.sleep = func(d time.Duration) {
+		slept = append(slept, d)
+		now = now.Add(d)
+	}
+	return &slept
+}
+
+func expectPS(runner *subprocess.MockRunner, result subprocess.Result, err error, args ...string) *mock.Call {
+	callArgs := []interface{}{mock.Anything, "", "ps"}
+	for _, arg := range args {
+		callArgs = append(callArgs, arg)
+	}
+	return runner.On("Run", callArgs...).Return(result, err).Once()
+}
+
+func TestRepositoryCloseTaskWindow_KillsOnlyTheTasksWindowThenWaitsForItsProcessesAndSettles(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	slept := fakeClock(repo)
+	task := &core.Task{TmuxSession: "repo_task", TmuxWindow: "s2"}
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{Stdout: "100\n"}, nil,
+			"list-panes", "-t", "=repo_task:s2", "-F", "#{pane_pid}",
+		),
+		// The shell (100), the provider it started (200) and a tool of the
+		// provider (300); 999 is unrelated.
+		expectPS(runner, subprocess.Result{Stdout: "  100     1\n  200   100\n  300   200\n  999     1\n"}, nil,
+			"-axo", "pid=,ppid=",
+		),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"kill-window", "-t", "=repo_task:s2",
+		),
+		expectPS(runner, subprocess.Result{Stdout: "  200\n  300\n"}, nil, "-o", "pid=", "-p", "100,200,300"),
+		expectPS(runner, subprocess.Result{Stdout: "  300\n"}, nil, "-o", "pid=", "-p", "100,200,300"),
+		expectPS(runner, subprocess.Result{}, errors.New("exit status 1"), "-o", "pid=", "-p", "100,200,300"),
+	)
+
+	err := repo.CloseTaskWindow(context.Background(), task)
+
+	require.NoError(t, err)
+	require.Equal(t, []time.Duration{
+		closeWindowPollInterval, closeWindowPollInterval, defaultCloseWindowSettle,
+	}, *slept, "two polls while the provider winds down, then the settle")
+}
+
+func TestRepositoryCloseTaskWindow_FailsWhenTheProcessesDoNotExitInTime(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	slept := fakeClock(repo)
+	repo.closeWindowTimeout = 350 * time.Millisecond
+	task := &core.Task{TmuxSession: "repo_task"}
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{Stdout: "100\n"}, nil,
+			"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+		),
+		expectPS(runner, subprocess.Result{Stdout: "100 1\n200 100\n"}, nil, "-axo", "pid=,ppid="),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"kill-window", "-t", "=repo_task:task",
+		),
+	)
+	runner.On("Run", mock.Anything, "", "ps", "-o", "pid=", "-p", "100,200").
+		Return(subprocess.Result{Stdout: "200\n"}, nil)
+
+	err := repo.CloseTaskWindow(context.Background(), task)
+
+	require.ErrorContains(t, err, "200")
+	require.ErrorContains(t, err, "did not exit within 350ms")
+	for _, d := range *slept {
+		require.NotEqual(t, defaultCloseWindowSettle, d, "no settle after a timeout")
+	}
+}
+
+func TestRepositoryCloseTaskWindow_SettlesForTheConfiguredTime(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	slept := fakeClock(repo)
+	repo.closeWindowSettle = 7 * time.Second
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{Stdout: "100\n"}, nil,
+			"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+		),
+		expectPS(runner, subprocess.Result{Stdout: "100 1\n"}, nil, "-axo", "pid=,ppid="),
+		expectTmuxRun(runner, subprocess.Result{}, nil, "kill-window", "-t", "=repo_task:task"),
+		expectPS(runner, subprocess.Result{}, errors.New("exit status 1"), "-o", "pid=", "-p", "100"),
+	)
+
+	require.NoError(t, repo.CloseTaskWindow(context.Background(), &core.Task{TmuxSession: "repo_task"}))
+	require.Equal(t, []time.Duration{7 * time.Second}, *slept)
+}
+
+func TestRepositoryCloseTaskWindow_FollowsAProviderReparentedByItsDyingShell(t *testing.T) {
+	// After the pane's shell is gone, ps lists its children under pid 1. The
+	// provider was noted before the kill and is still waited for.
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	fakeClock(repo)
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{Stdout: "100\n"}, nil,
+			"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+		),
+		expectPS(runner, subprocess.Result{Stdout: "100 1\n200 100\n"}, nil, "-axo", "pid=,ppid="),
+		expectTmuxRun(runner, subprocess.Result{}, nil, "kill-window", "-t", "=repo_task:task"),
+		expectPS(runner, subprocess.Result{Stdout: "200\n"}, nil, "-o", "pid=", "-p", "100,200"),
+		expectPS(runner, subprocess.Result{}, errors.New("exit status 1"), "-o", "pid=", "-p", "100,200"),
+	)
+
+	require.NoError(t, repo.CloseTaskWindow(context.Background(), &core.Task{TmuxSession: "repo_task"}))
+}
+
+func TestRepositoryCloseTaskWindow_WaitsOnThePaneShellAloneWhenTheProcessListIsUnavailable(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	fakeClock(repo)
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{Stdout: "100\n101\n"}, nil,
+			"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+		),
+		expectPS(runner, subprocess.Result{}, errors.New("ps failed"), "-axo", "pid=,ppid="),
+		expectTmuxRun(runner, subprocess.Result{}, nil, "kill-window", "-t", "=repo_task:task"),
+		expectPS(runner, subprocess.Result{}, errors.New("exit status 1"), "-o", "pid=", "-p", "100,101"),
+	)
+
+	require.NoError(t, repo.CloseTaskWindow(context.Background(), &core.Task{TmuxSession: "repo_task"}))
+}
+
+func TestRepositoryCloseTaskWindow_AWindowAlreadyGoneIsClosed(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	slept := fakeClock(repo)
+	expectTmuxRun(runner, subprocess.Result{Stderr: "can't find window: task"}, errors.New("exit status 1"),
+		"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+	)
+
+	err := repo.CloseTaskWindow(context.Background(), &core.Task{TmuxSession: "repo_task"})
+
+	require.NoError(t, err)
+	require.Empty(t, *slept)
+}
+
+func TestRepositoryCloseTaskWindow_ReturnsTmuxFailures(t *testing.T) {
+	t.Run("reading the pane", func(t *testing.T) {
+		runner := subprocess.NewMockRunner(t)
+		repo := New(runner).(*repository)
+		expectTmuxRun(runner, subprocess.Result{Stderr: "protocol version mismatch"}, errors.New("exit status 1"),
+			"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+		)
+
+		require.ErrorContains(t, repo.CloseTaskWindow(context.Background(), &core.Task{TmuxSession: "repo_task"}),
+			"exit status 1")
+	})
+	t.Run("killing the window", func(t *testing.T) {
+		runner := subprocess.NewMockRunner(t)
+		repo := New(runner).(*repository)
+		fakeClock(repo)
+		mock.InOrder(
+			expectTmuxRun(runner, subprocess.Result{Stdout: "100\n"}, nil,
+				"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+			),
+			expectPS(runner, subprocess.Result{Stdout: "100 1\n"}, nil, "-axo", "pid=,ppid="),
+			expectTmuxRun(runner, subprocess.Result{Stderr: "server exited"}, errors.New("exit status 1"),
+				"kill-window", "-t", "=repo_task:task",
+			),
+		)
+
+		require.ErrorContains(t, repo.CloseTaskWindow(context.Background(), &core.Task{TmuxSession: "repo_task"}),
+			"exit status 1")
+	})
+}
+
+func TestRepositoryCloseTaskWindow_StopsWaitingWhenTheContextIsCancelled(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	fakeClock(repo)
+	ctx, cancel := context.WithCancel(context.Background())
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{Stdout: "100\n"}, nil,
+			"list-panes", "-t", "=repo_task:task", "-F", "#{pane_pid}",
+		),
+		expectPS(runner, subprocess.Result{Stdout: "100 1\n"}, nil, "-axo", "pid=,ppid="),
+		expectTmuxRun(runner, subprocess.Result{}, nil, "kill-window", "-t", "=repo_task:task"),
+	)
+	runner.On("Run", mock.Anything, "", "ps", "-o", "pid=", "-p", "100").
+		Run(func(mock.Arguments) { cancel() }).
+		Return(subprocess.Result{Stdout: "100\n"}, nil)
+
+	err := repo.CloseTaskWindow(ctx, &core.Task{TmuxSession: "repo_task"})
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestQuoteShellCommand_LeavesSafeWordsAloneAndQuotesTheRest(t *testing.T) {
+	tests := []struct {
+		word string
+		want string
+	}{
+		{"claude", "claude"},
+		{"--permission-mode", "--permission-mode"},
+		{"CLAUDE_CONFIG_DIR=/home/me/.claude-work", "CLAUDE_CONFIG_DIR=/home/me/.claude-work"},
+		{"model_reasoning_effort=high", "model_reasoning_effort=high"},
+		{"/data/prompts/1760.txt", "/data/prompts/1760.txt"},
+		{"a+b,c@d%e:f", "a+b,c@d%e:f"},
+		{"", "''"},
+		{"two words", "'two words'"},
+		{"it's", `'it'\''s'`},
+		{"$HOME", "'$HOME'"},
+		{"a;b", "'a;b'"},
+		{"a&&b", "'a&&b'"},
+		{"a|b", "'a|b'"},
+		{"a>b", "'a>b'"},
+		{"*.go", "'*.go'"},
+		{"~/x", "'~/x'"},
+		{"a\\b", `'a\b'`},
+		{"(x)", "'(x)'"},
+		{"#x", "'#x'"},
+		{"`id`", "'`id`'"},
+		{"!x", "'!x'"},
+		{"{a,b}", "'{a,b}'"},
+		{"say \"hi\"", `'say "hi"'`},
+		{"line\nbreak", "'line\nbreak'"},
+		{"tab\there", "'tab\there'"},
+		{"=cmd", "'=cmd'"},
+		{"naïve", "'naïve'"},
+	}
+	for _, tt := range tests {
+		require.Equal(t, []string{tt.want}, quoteShellCommand([]string{tt.word}), "%q", tt.word)
+	}
+}
+
+// promptWrapperScript is the script core wraps a prompt run's argv in.
+const promptWrapperScript = `p=$(cat "$0" && printf x) || exit; exec "$@" -- "${p%x}"`
+
+func TestQuoteShellCommand_QuotesThePromptRunWrapperScript(t *testing.T) {
+	command := []string{
+		"sh", "-c", promptWrapperScript, "/data/prompts/task 1.txt",
+		"env", "CLAUDE_CONFIG_DIR=/home/me/.claude-work", "claude", "--permission-mode", "auto",
+	}
+
+	line := strings.Join(quoteShellCommand(command), " ")
+
+	require.Equal(t,
+		`sh -c 'p=$(cat "$0" && printf x) || exit; exec "$@" -- "${p%x}"' '/data/prompts/task 1.txt' `+
+			`env CLAUDE_CONFIG_DIR=/home/me/.claude-work claude --permission-mode auto`,
+		line)
+}
+
+func TestQuoteShellCommand_ALineTypedIntoAShellDeliversThePromptIntact(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"leading dash":     "- fix everything",
+		"trailing newline": "triage the issues\n\n\n",
+		"quotes and shell": "it's \"quoted\" $HOME ${HOME} `id` $(id) \\ ; && | > < \t tab é",
+		"just a flag":      "--help",
+	} {
+		t.Run(name, func(t *testing.T) {
+			promptFile := filepath.Join(t.TempDir(), "task 1.txt")
+			require.NoError(t, os.WriteFile(promptFile, []byte(prompt), 0o600))
+			// The provider stands in as a shell that prints its last argument.
+			command := []string{
+				"sh", "-c", promptWrapperScript, promptFile,
+				"sh", "-c", `printf %s "$2"`, "provider",
+			}
+
+			// This is what send-keys types into the pane's shell.
+			out, err := exec.CommandContext(t.Context(), "sh", "-c", strings.Join(quoteShellCommand(command), " ")).
+				Output()
+
+			require.NoError(t, err)
+			require.Equal(t, prompt, string(out))
+		})
+	}
+}
+
+func TestRepositoryStartTaskSession_TypesThePromptRunWrapperIntoTheShellAsOneQuotedLine(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	repo.sleep = func(time.Duration) {}
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{}, nil, "has-session", "-t", "=repo_task"),
+		expectTmuxRun(runner, subprocess.Result{Stdout: "task\neditor\n"}, nil,
+			"list-windows", "-t", "=repo_task", "-F", "#{window_name}",
+		),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"send-keys", "-t", "=repo_task:task",
+			`sh -c 'p=$(cat "$0" && printf x) || exit; exec "$@" -- "${p%x}"' `+
+				`/data/prompts/task-1.txt claude --permission-mode auto`,
+			"C-m",
+		),
+	)
+
+	err := repo.StartTaskSession(context.Background(), &core.Task{
+		TmuxSession:  "repo_task",
+		WorktreePath: "/tmp/repo-task",
+	}, core.TaskSessionLaunchSpec{
+		Command: []string{
+			"sh", "-c", promptWrapperScript, "/data/prompts/task-1.txt",
+			"claude", "--permission-mode", "auto",
+		},
+	})
+
+	require.NoError(t, err)
 }

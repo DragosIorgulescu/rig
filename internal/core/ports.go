@@ -78,6 +78,47 @@ type NewTaskSessionInput struct {
 	NewWindow bool `json:"new_window,omitempty"`
 }
 
+// PromptRunSessionMode says which provider session a prompt run uses.
+type PromptRunSessionMode string
+
+const (
+	// PromptRunSessionNew starts a fresh provider session.
+	PromptRunSessionNew PromptRunSessionMode = "new"
+	// PromptRunSessionSame resumes the Task's latest provider session.
+	PromptRunSessionSame PromptRunSessionMode = "same"
+)
+
+// RunTaskPromptInput is one prompt run: Prompt is what the Task's provider is
+// asked, in a fresh session or the previous one.
+type RunTaskPromptInput struct {
+	TaskID string `json:"task_id"`
+	Prompt string `json:"prompt"`
+	// SessionMode defaults to PromptRunSessionNew.
+	SessionMode PromptRunSessionMode `json:"session_mode,omitempty"`
+	// PermissionMode defaults to TaskPermissionModeAuto.
+	PermissionMode TaskPermissionMode `json:"permission_mode,omitempty"`
+}
+
+// PromptRunOutcome says whether a prompt run started a session.
+type PromptRunOutcome string
+
+const (
+	// PromptRunLaunched means the provider was started with the prompt. It
+	// says nothing about how the run ends.
+	PromptRunLaunched PromptRunOutcome = "launched"
+	// PromptRunSkipped means the run was left alone because the Task was busy
+	// or not ready for it. A skip is a normal result, not a failure.
+	PromptRunSkipped PromptRunOutcome = "skipped"
+)
+
+// RunTaskPromptResult is how a prompt run went. Detail is short and meant to
+// be read by a person: "resumed 3f2a…", "started fresh", "skipped: still
+// working".
+type RunTaskPromptResult struct {
+	Outcome PromptRunOutcome `json:"outcome"`
+	Detail  string           `json:"detail"`
+}
+
 type TaskCreateProgressStep string
 
 const (
@@ -284,6 +325,14 @@ type TaskService interface {
 	// under the window's provider configuration env, and the options each was
 	// last launched with.
 	GetLaunchSettings(ctx context.Context, env ProviderEnv) (*LaunchSettings, error)
+	// RunTaskPrompt starts the Task's provider on a stored prompt, in a fresh
+	// session or the previous one, unless the Task is busy: being viewed,
+	// working, waiting on a permission prompt, running something else, shelved,
+	// or locked by another operation. A skip is a normal result, not an error;
+	// errors are real failures. It returns once the provider is launched and
+	// has taken the prompt, or has stayed silent for a bounded time, without
+	// waiting for the run to finish. The Task stays busy until then.
+	RunTaskPrompt(ctx context.Context, input RunTaskPromptInput) (RunTaskPromptResult, error)
 }
 
 // HookEventHandler consumes provider hook events inside the daemon process.
@@ -439,6 +488,19 @@ type ProviderClient interface {
 	// ReadSessionFileChanges reads the file edits one provider session made,
 	// including edits made by its subagents, as absolute paths.
 	ReadSessionFileChanges(ctx context.Context, session TaskProviderSession) ([]SessionFileChange, error)
+	// BuildPromptRunLaunchSpec describes how the provider's CLI starts a
+	// session that takes its prompt as its last argument, fresh or resuming
+	// run.ResumeSessionID, with the Task's ProviderEnv and launch options and
+	// the permission mode run asks for. The spec holds the provider's argv
+	// only: no prompt, which the caller appends, and no PrefillInput. A
+	// provider that cannot honour the permission mode returns an error.
+	BuildPromptRunLaunchSpec(task *Task, run PromptRunLaunch) (TaskSessionLaunchSpec, error)
+	// LastTurnInterrupted reports whether the user interrupted the last turn
+	// of one of the Task's provider sessions, which leaves it idle although
+	// its last status still says it is working. The session is as rig recorded
+	// it from the provider's hooks, with the transcript path they reported,
+	// when there is one. False when it cannot tell.
+	LastTurnInterrupted(ctx context.Context, task *Task, session TaskProviderSession) (bool, error)
 	// ListFolderSessions lists up to limit (all when limit <= 0) provider
 	// sessions started in folder or any folder below it, most recently active
 	// first, from the provider's
@@ -529,6 +591,22 @@ type TmuxSessionClient interface {
 	InspectTaskSessions(ctx context.Context, tasks []*Task) (map[string]TaskSessionRuntimeState, error)
 	// DeleteTaskSession tears down the task session during task deletion.
 	DeleteTaskSession(ctx context.Context, task *Task) error
+	// TaskWindowViewed reports whether a tmux client is showing the task's
+	// window now. No tmux server means nobody is viewing it.
+	TaskWindowViewed(ctx context.Context, task *Task) (bool, error)
+	// CloseTaskWindow closes the task's window, and only that window: the
+	// session also holds the editor window and the task's child windows. It
+	// returns once the processes that ran in the window have exited and had
+	// a moment to finish reporting, or fails if they do not exit in time.
+	CloseTaskWindow(ctx context.Context, task *Task) error
+}
+
+// PromptFileStore keeps the prompt of a prompt run in a file, so it reaches
+// the provider as one argument whatever it contains.
+type PromptFileStore interface {
+	// WritePromptFile writes text to the task's prompt file, replacing the
+	// previous run's, readable by the user alone, and returns its path.
+	WritePromptFile(taskID string, text string) (string, error)
 }
 
 // TaskWorkspaceManager applies repo-local setup and provider bootstrap files

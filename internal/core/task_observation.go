@@ -201,6 +201,12 @@ func (o *taskObservation) LatestTaskStatus(ctx context.Context, taskID string) (
 	return o.statusObserver.LatestTaskStatus(ctx, strings.TrimSpace(taskID))
 }
 
+// FreshTaskStatus is LatestTaskStatus without the cached view, for callers that
+// act on the status.
+func (o *taskObservation) FreshTaskStatus(ctx context.Context, taskID string) (*TaskStatusUpdate, error) {
+	return o.statusObserver.FreshTaskStatus(ctx, strings.TrimSpace(taskID))
+}
+
 func (o *taskObservation) SubscribeTaskStatus(
 	ctx context.Context,
 	taskID string,

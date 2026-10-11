@@ -13,6 +13,7 @@ import (
 	"github.com/BaronBonet/rig/internal/adapters/client/github"
 	"github.com/BaronBonet/rig/internal/adapters/client/tmux"
 	"github.com/BaronBonet/rig/internal/adapters/handler/tui"
+	"github.com/BaronBonet/rig/internal/adapters/repository/promptfile"
 	"github.com/BaronBonet/rig/internal/adapters/repository/sqlite"
 	"github.com/BaronBonet/rig/internal/adapters/repository/userconfig"
 	"github.com/BaronBonet/rig/internal/adapters/taskdaemon"
@@ -120,6 +121,9 @@ func newProductionCommandRuntime(stdout io.Writer, stderr io.Writer) commandRunt
 			renderDaemonStatus(stdout, status)
 			return nil
 		},
+		runScheduleTry: func(request scheduleTryRequest) error {
+			return runScheduleTry(stdout, request)
+		},
 	}
 }
 
@@ -135,6 +139,7 @@ type commandRuntime struct {
 	runDaemonStop    func() error
 	runDaemonRestart func() error
 	runDaemonStatus  func() error
+	runScheduleTry   func(request scheduleTryRequest) error
 }
 
 func newRootCommand(runtime commandRuntime) *cobra.Command {
@@ -162,6 +167,7 @@ func newRootCommand(runtime commandRuntime) *cobra.Command {
 	root.AddCommand(newSetupCommand(runtime))
 	root.AddCommand(newDoctorCommand(runtime))
 	root.AddCommand(newDaemonCommand(runtime))
+	root.AddCommand(newScheduleCommand(runtime))
 
 	return root
 }
@@ -531,6 +537,7 @@ func serveTaskDaemon(
 		Workspace:            repositoryworkspace.New(),
 		EnableWorkspaceSetup: true,
 		ProviderConfig:       providerConfig,
+		PromptFiles:          promptfile.New(filepath.Dir(cfg.SQLite.Path)),
 	})
 
 	for _, refreshErr := range providerregistry.RefreshProviderEnvironments(ctx, providers, providerConfig) {

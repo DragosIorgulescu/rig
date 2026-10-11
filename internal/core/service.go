@@ -16,6 +16,7 @@ type TaskServiceDependencies struct {
 	Providers            map[Provider]ProviderClient
 	Workspace            TaskWorkspaceManager
 	ProviderConfig       ProviderConfigStore
+	PromptFiles          PromptFileStore
 	EnableWorkspaceSetup bool
 }
 
@@ -34,6 +35,7 @@ type service struct {
 	pullRequests   PullRequestClient
 	providers      map[Provider]ProviderClient
 	providerConfig ProviderConfigStore
+	promptFiles    PromptFileStore
 	launcher       *sessionLauncher
 	creation       *taskCreation
 	observation    *taskObservation
@@ -96,6 +98,7 @@ func NewTaskService(deps TaskServiceDependencies) *service {
 		pullRequests:    deps.PullRequests,
 		providers:       deps.Providers,
 		providerConfig:  deps.ProviderConfig,
+		promptFiles:     deps.PromptFiles,
 		launcher:        launcher,
 		creation:        newTaskCreation(deps.Tasks, deps.GitWorktree, launcher, operations),
 		worktrees:       newTaskWorktrees(deps.Tasks, deps.GitWorktree, deps.Providers),
