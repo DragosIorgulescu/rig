@@ -290,13 +290,7 @@ type TaskStatusUpdate struct {
 
 // TaskSessionRuntimeState is the current tmux-side state of a task session.
 type TaskSessionRuntimeState struct {
-	// ActiveCommands are the pane's foreground command and the commands of
-	// the direct child processes of its root process, the shell.
 	ActiveCommands []string
-	// ChildCommands are those direct child processes alone. A shell waiting at
-	// its prompt has none; whatever else runs in the pane, a script, an editor
-	// or a nested shell, shows up here.
-	ChildCommands []string
 	// CommandStartedAt maps the command of each pane child process to when its
 	// newest process started. Commands without a known start time, such as the
 	// pane's foreground command, are absent.

@@ -189,18 +189,6 @@ func (f *frontend) GetLaunchSettings(ctx context.Context, env core.ProviderEnv) 
 	return callUnary(ctx, f, opGetLaunchSettings, launchSettingsRequest{Env: env})
 }
 
-func (f *frontend) RunTaskPrompt(
-	ctx context.Context,
-	input core.RunTaskPromptInput,
-) (core.RunTaskPromptResult, error) {
-	return callUnary(ctx, f, opRunTaskPrompt, runTaskPromptRequest{
-		TaskID:         input.TaskID,
-		Prompt:         input.Prompt,
-		SessionMode:    input.SessionMode,
-		PermissionMode: input.PermissionMode,
-	})
-}
-
 func (f *frontend) RetryTaskCreationStream(
 	ctx context.Context,
 	taskID string,

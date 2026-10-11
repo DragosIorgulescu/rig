@@ -33,13 +33,22 @@ const (
 	rigLastSessionOption = "@rig_last_session"
 	// rigFolderOption, set on a rig's own session, is the folder it runs for.
 	rigFolderOption = "@rig_folder"
-	// defaultCloseWindowTimeout bounds how long closing a task window waits
-	// for the processes that ran in it to exit, and defaultCloseWindowSettle
-	// is the pause after they have, so the old provider's SessionEnd hook
-	// cannot land after the hooks of the session that replaces it.
-	defaultCloseWindowTimeout = 15 * time.Second
-	defaultCloseWindowSettle  = 2 * time.Second
-	closeWindowPollInterval   = 100 * time.Millisecond
+	// promptPasteSettleDelay is the pause between pasting a prompt and the
+	// Enter that submits it. A long paste takes the provider a moment to
+	// take in, and an Enter sent before it has would be part of the paste.
+	promptPasteSettleDelay = time.Second
+	// paneTailLines is how many of the last non-empty lines of a pane
+	// TaskPaneShows looks at: the provider's status line sits at the bottom of
+	// its screen, and what is above it is the conversation, which may well
+	// mention the markers.
+	paneTailLines = 10
+	// defaultRespawnTimeout bounds how long respawning a task pane waits for
+	// the processes that ran in it to exit, and defaultRespawnSettle is the
+	// pause after they have, so the old provider's SessionEnd hook cannot land
+	// after the hooks of the session that replaces it.
+	defaultRespawnTimeout = 15 * time.Second
+	defaultRespawnSettle  = 2 * time.Second
+	respawnPollInterval   = 100 * time.Millisecond
 )
 
 type repository struct {
@@ -47,10 +56,10 @@ type repository struct {
 	now    func() time.Time
 	sleep  func(time.Duration)
 	getenv func(string) string
-	// closeWindowTimeout and closeWindowSettle override the defaults of
-	// CloseTaskWindow's wait; zero keeps the default.
-	closeWindowTimeout time.Duration
-	closeWindowSettle  time.Duration
+	// respawnTimeout and respawnSettle override the defaults of
+	// RespawnTaskPane's wait; zero keeps the default.
+	respawnTimeout time.Duration
+	respawnSettle  time.Duration
 }
 
 func New(runner subprocess.Runner) core.TmuxSessionClient {
@@ -337,7 +346,6 @@ func (r *repository) InspectTaskSession(ctx context.Context, task *core.Task) (c
 	return core.TaskSessionRuntimeState{
 		Exists:                          true,
 		ActiveCommands:                  append(commands, processCommands(children)...),
-		ChildCommands:                   processCommands(children),
 		CommandStartedAt:                processCommandStartTimes(children),
 		ChildProcessEvidenceUnavailable: !childEvidenceAvailable,
 	}, nil
@@ -437,7 +445,6 @@ func (r *repository) InspectTaskSessions(
 			states[taskID] = core.TaskSessionRuntimeState{
 				Exists:                          true,
 				ActiveCommands:                  append([]string(nil), activeCommands...),
-				ChildCommands:                   processCommands(children),
 				CommandStartedAt:                processCommandStartTimes(children),
 				ChildProcessEvidenceUnavailable: !childEvidenceAvailable,
 			}
@@ -571,7 +578,7 @@ func (r *repository) runningProcesses(ctx context.Context, pids []string) []stri
 }
 
 func processCommands(processes []paneChildProcess) []string {
-	var commands []string
+	commands := make([]string, 0, len(processes))
 	for _, process := range processes {
 		commands = append(commands, process.command)
 	}
@@ -614,38 +621,65 @@ func (r *repository) DeleteTaskSession(ctx context.Context, task *core.Task) err
 	return err
 }
 
-// TaskWindowViewed reports whether a tmux client is showing the task's window:
-// a client of the task's session whose current window is the task's.
-func (r *repository) TaskWindowViewed(ctx context.Context, task *core.Task) (bool, error) {
+// TaskPaneShows reports whether any of markers is among the last lines of what
+// the task's window shows now. It looks at the window's visible text only, not
+// its history, and at its last non-empty lines only, where a provider's status
+// line is. A pane that cannot be captured is an error; the caller decides what
+// that means.
+func (r *repository) TaskPaneShows(ctx context.Context, task *core.Task, markers []string) (bool, error) {
 	if task == nil || strings.TrimSpace(task.TmuxSession) == "" {
-		return false, nil
+		return false, fmt.Errorf("task tmux session is required")
 	}
-
-	result, err := r.runner.Run(ctx, "", "tmux", "list-clients", "-F", "#{session_name}\t#{window_name}")
-	if isNoTmuxServerError(err, result) {
-		return false, nil
-	}
+	content, err := r.capturePaneContent(ctx, task.TmuxSession, windowOf(task))
 	if err != nil {
 		return false, err
 	}
 
-	session := normalizedSessionName(strings.TrimSpace(task.TmuxSession))
-	window := windowOf(task)
-	for _, line := range strings.Split(result.Stdout, "\n") {
-		clientSession, clientWindow, ok := strings.Cut(strings.TrimSuffix(line, "\r"), "\t")
-		if ok && strings.TrimSpace(clientSession) == session && strings.TrimSpace(clientWindow) == window {
-			return true, nil
+	var tail []string
+	lines := strings.Split(content, "\n")
+	for i := len(lines) - 1; i >= 0 && len(tail) < paneTailLines; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			tail = append(tail, strings.ToLower(line))
+		}
+	}
+	for _, marker := range markers {
+		marker = strings.ToLower(strings.TrimSpace(marker))
+		if marker == "" {
+			continue
+		}
+		for _, line := range tail {
+			if strings.Contains(line, marker) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
 }
 
-// CloseTaskWindow kills the task's window, never its session, which also holds
-// the editor window and the task's child windows, and waits for the processes
-// that ran in the window to exit. The processes are noted before the kill:
-// once the pane's shell is gone, what it started is reparented and can no
-// longer be found as its children.
-func (r *repository) CloseTaskWindow(ctx context.Context, task *core.Task) error {
+// SubmitTaskPrompt pastes text into the task's window as one bracketed paste,
+// so the provider takes its newlines as part of the message rather than as
+// Enter, then presses Enter once the paste has settled.
+func (r *repository) SubmitTaskPrompt(ctx context.Context, task *core.Task, text string) error {
+	if task == nil || strings.TrimSpace(task.TmuxSession) == "" {
+		return fmt.Errorf("task tmux session is required")
+	}
+	if err := r.typeInWindow(ctx, task.TmuxSession, windowOf(task), []string{text}); err != nil {
+		return err
+	}
+	r.sleep(promptPasteSettleDelay)
+	_, err := r.runner.Run(
+		ctx, "", "tmux", "send-keys", "-t", exactWindowTarget(task.TmuxSession, windowOf(task)), "Enter",
+	)
+	return err
+}
+
+// RespawnTaskPane replaces what runs in the task's window with a fresh shell:
+// `respawn-pane -k` kills the pane's process and starts the pane's shell again,
+// and the window and its session stay. It then waits for the processes that
+// ran in the pane to exit. They are noted before the respawn: once the pane's
+// shell is gone, what it started is reparented and can no longer be found as
+// its children.
+func (r *repository) RespawnTaskPane(ctx context.Context, task *core.Task) error {
 	if task == nil || strings.TrimSpace(task.TmuxSession) == "" {
 		return nil
 	}
@@ -661,7 +695,7 @@ func (r *repository) CloseTaskWindow(ctx context.Context, task *core.Task) error
 	panePIDs := strings.Fields(result.Stdout)
 	processes := r.processTree(ctx, panePIDs)
 
-	result, err = r.runner.Run(ctx, "", "tmux", "kill-window", "-t", target)
+	result, err = r.runner.Run(ctx, "", "tmux", "respawn-pane", "-k", "-t", target)
 	if isMissingSessionError(err, result) {
 		return nil
 	}
@@ -669,7 +703,7 @@ func (r *repository) CloseTaskWindow(ctx context.Context, task *core.Task) error
 		return err
 	}
 
-	timeout := cmp.Or(r.closeWindowTimeout, defaultCloseWindowTimeout)
+	timeout := cmp.Or(r.respawnTimeout, defaultRespawnTimeout)
 	deadline := r.now().Add(timeout)
 	for {
 		alive := r.runningProcesses(ctx, processes)
@@ -681,13 +715,13 @@ func (r *repository) CloseTaskWindow(ctx context.Context, task *core.Task) error
 			break
 		}
 		if !r.now().Before(deadline) {
-			return fmt.Errorf("processes %s of the closed task window did not exit within %s",
+			return fmt.Errorf("processes %s of the respawned task pane did not exit within %s",
 				strings.Join(alive, ", "), timeout)
 		}
-		r.sleep(closeWindowPollInterval)
+		r.sleep(respawnPollInterval)
 	}
 
-	r.sleep(cmp.Or(r.closeWindowSettle, defaultCloseWindowSettle))
+	r.sleep(cmp.Or(r.respawnSettle, defaultRespawnSettle))
 	return nil
 }
 

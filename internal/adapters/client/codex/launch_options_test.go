@@ -167,13 +167,11 @@ func TestRepositoryBuildPromptRunLaunchSpec_RefusesWhatCodexCannotDo(t *testing.
 	require.ErrorContains(t, err, "unknown permission mode")
 }
 
-func TestRepositoryLastTurnInterrupted_IsNeverTrue(t *testing.T) {
+func TestRepositoryBusyMarkers_AreWhatCodexShowsOnlyWhileATurnRuns(t *testing.T) {
 	repo := New(subprocess.NewMockRunner(t), Config{Binary: "codex"}, HookForwardingConfig{}).(*repository)
 
-	got, err := repo.LastTurnInterrupted(
-		context.Background(), &core.Task{}, core.TaskProviderSession{ProviderSessionID: "sess-1"},
-	)
+	require.Equal(t, []string{"esc to interrupt"}, repo.BusyMarkers())
 
-	require.NoError(t, err)
-	require.False(t, got)
+	repo.BusyMarkers()[0] = "changed"
+	require.Equal(t, []string{"esc to interrupt"}, repo.BusyMarkers(), "the list is the repository's own")
 }

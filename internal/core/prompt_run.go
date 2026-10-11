@@ -5,28 +5,76 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
-// maxPromptRunPromptBytes caps a prompt. It reaches the provider as one
-// argument of its command, which the system refuses to start when too long:
-// Linux allows 128 KiB for one argument, macOS about 1 MiB for the whole
-// command and environment. The cap leaves room under both.
+// maxPromptRunPromptBytes caps a prompt. A launch hands it to the provider as
+// one argument of its command, which the system refuses to start when too
+// long: Linux allows 128 KiB for one argument, macOS about 1 MiB for the whole
+// command and environment. The cap leaves room under both, and holds for a
+// prompt sent to a running session too, so a run does not depend on which of
+// the two it turns out to be.
 const maxPromptRunPromptBytes = 96 * 1024
 
-// RunTaskPrompt starts the Task's provider on the prompt, or reports why it did
-// not. The checks run in order and the first one that fails decides the
-// outcome: the Task must be ready and on the current list, no other Task
-// operation may be running, nobody may be viewing its window, and whatever is
-// in the window must be idle or gone. A busy Task is skipped, never
-// interrupted: a skip is a normal result, and errors are for real failures.
+const (
+	// defaultPromptRunRecheckInterval is how long a run waits between its two
+	// looks at the window.
+	defaultPromptRunRecheckInterval = time.Second
+	// defaultPromptRunTakenWait is how long a run waits for a running session
+	// to take the prompt it was sent.
+	defaultPromptRunTakenWait = 15 * time.Second
+	// defaultPromptRunTakenPoll paces that wait.
+	defaultPromptRunTakenPoll = 250 * time.Millisecond
+)
+
+// promptRunTiming is the pacing of a prompt run. A zero value keeps the
+// default; tests and the sandbox shorten them.
+type promptRunTiming struct {
+	// recheckInterval separates the two looks at the window that decide
+	// whether the session is busy: a turn's status line can be off screen
+	// for a moment between two of its steps.
+	recheckInterval time.Duration
+	// takenWait bounds the wait for a running session to take a prompt sent
+	// to it, and takenPoll paces it.
+	takenWait time.Duration
+	takenPoll time.Duration
+}
+
+func (t promptRunTiming) recheck() time.Duration {
+	return cmp.Or(t.recheckInterval, defaultPromptRunRecheckInterval)
+}
+
+func (t promptRunTiming) takeWait() time.Duration {
+	return cmp.Or(t.takenWait, defaultPromptRunTakenWait)
+}
+
+func (t promptRunTiming) takePoll() time.Duration {
+	return cmp.Or(t.takenPoll, defaultPromptRunTakenPoll)
+}
+
+// RunTaskPrompt gives the Task's provider a prompt, or reports why it did not.
+// It is what a scheduled run does.
+//
+// Only a session that is busy is left alone: the Task must be ready and on the
+// current list, no other Task operation may be running, and the session must
+// not be working on a turn or blocked on a permission prompt. Whether the
+// user is looking at the window does not matter. A skip is a normal result.
+//
+// With PromptRunSessionSame, a provider that is running in the Task's window
+// is sent the prompt, and otherwise it is started with the prompt, resuming
+// the Task's last session when there is one. With PromptRunSessionNew, whatever
+// session is in the window is ended and a fresh one is started with the prompt.
+//
+// Errors are for input that cannot be a run, a Task that cannot be read, and a
+// cancelled context. A run that goes wrong with a cause the user can act on, a
+// launch that fails or a session that does not take the prompt, is a result
+// with the PromptRunFailed outcome.
 //
 // The Task's operation lock is held until the provider has taken the prompt,
-// not only until its command is typed: a second run, or any other operation,
-// that came in while the provider was still starting would see a bare shell,
-// or a status left by the session before, and type over or close the run.
+// not only until it was sent or its command typed: a second run, or any other
+// operation, that came in while the provider was still starting would see a
+// bare shell, or a status left by the session before, and type over the run.
 func (s *service) RunTaskPrompt(ctx context.Context, input RunTaskPromptInput) (RunTaskPromptResult, error) {
 	run, err := newPromptRun(input)
 	if err != nil {
@@ -56,7 +104,13 @@ func (s *service) RunTaskPrompt(ctx context.Context, input RunTaskPromptInput) (
 			return nil
 		}
 		result, err = s.runTaskPrompt(ctx, task, run)
-		return err
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			result = promptRunFailed(err.Error())
+		}
+		return nil
 	})
 	if errors.Is(err, ErrTaskOperationInProgress) {
 		return promptRunSkipped("another operation is running"), nil
@@ -122,10 +176,19 @@ func newPromptRun(input RunTaskPromptInput) (promptRun, error) {
 }
 
 func promptRunSkipped(reason string) RunTaskPromptResult {
-	return RunTaskPromptResult{Outcome: PromptRunSkipped, Detail: "skipped: " + reason}
+	return RunTaskPromptResult{Outcome: PromptRunSkipped, Detail: reason}
 }
 
-// runTaskPrompt is RunTaskPrompt once the Task's operation lock is held.
+func promptRunFailed(detail string) RunTaskPromptResult {
+	return RunTaskPromptResult{Outcome: PromptRunFailed, Detail: detail}
+}
+
+func promptRunStarted(detail string) RunTaskPromptResult {
+	return RunTaskPromptResult{Outcome: PromptRunStarted, Detail: detail}
+}
+
+// runTaskPrompt is RunTaskPrompt once the Task's operation lock is held. An
+// error it returns is a run that failed.
 func (s *service) runTaskPrompt(ctx context.Context, task *Task, run promptRun) (RunTaskPromptResult, error) {
 	_, providerClient, err := s.launcher.resolveProvider(ctx, task.Provider)
 	if err != nil {
@@ -135,24 +198,179 @@ func (s *service) runTaskPrompt(ctx context.Context, task *Task, run promptRun) 
 		return RunTaskPromptResult{}, fmt.Errorf("prompt file store not configured")
 	}
 
-	viewed, err := s.tmuxSession.TaskWindowViewed(ctx, task)
-	if err != nil {
-		return RunTaskPromptResult{}, fmt.Errorf("check whether the task window is being viewed: %w", err)
-	}
-	if viewed {
-		return promptRunSkipped("you're viewing it"), nil
-	}
-
-	window, err := s.promptRunWindow(ctx, task, providerClient)
+	running, err := s.providerRunning(ctx, task, providerClient)
 	if err != nil {
 		return RunTaskPromptResult{}, err
 	}
-	if window.busy != "" {
-		return promptRunSkipped(window.busy), nil
+	active, reason, err := s.sessionActive(ctx, task, providerClient, running)
+	if err != nil {
+		return RunTaskPromptResult{}, err
+	}
+	if active {
+		return promptRunSkipped(reason), nil
 	}
 
+	if running && run.sessionMode == PromptRunSessionSame {
+		return s.sendPromptToSession(ctx, task, providerClient, run)
+	}
+	// Whatever is running is idle, and a fresh session replaces it.
+	return s.startPromptRunSession(ctx, task, providerClient, run, running)
+}
+
+// providerRunning reports whether the Task's provider runs in its window.
+func (s *service) providerRunning(ctx context.Context, task *Task, providerClient ProviderClient) (bool, error) {
+	runtime, err := s.tmuxSession.InspectTaskSession(ctx, task)
+	if err != nil {
+		return false, fmt.Errorf("inspect task session: %w", err)
+	}
+	return taskSessionRunningProvider(runtime, providerClient.TaskSessionCommandName()), nil
+}
+
+// sessionActive reports whether the Task's session is busy, and why. A session
+// is busy when it is working on a turn or blocked on a permission prompt, and
+// in no other case: that the user is looking at the window, or that a hook
+// last said the provider was working, is not enough.
+//
+// The provider's hook status can be wrong in both directions. It stays at
+// working after the user interrupts a turn, since no hook reports that, so the
+// window is read: a turn that runs shows the provider's busy markers. The
+// window is read twice, an interval apart, since a marker can be off screen for
+// a moment. The hook status decides only when the window cannot be read.
+//
+// A provider that is not running has no session to be busy.
+func (s *service) sessionActive(
+	ctx context.Context,
+	task *Task,
+	providerClient ProviderClient,
+	running bool,
+) (bool, string, error) {
+	if !running {
+		return false, "", nil
+	}
+
+	// The status is read afresh: the cached view can be older than the hook
+	// event that made the provider ask for a permission.
+	status, err := s.observation.FreshTaskStatus(ctx, task.ID)
+	if err != nil {
+		return false, "", fmt.Errorf("read task status: %w", err)
+	}
+	if status != nil && status.Phase == TaskStatusPhaseWaitingForInput &&
+		(status.RawEventName == HookEventNotification || status.RawEventName == HookEventPermissionRequest) {
+		return true, "waiting on a permission prompt", nil
+	}
+
+	markers := providerClient.BusyMarkers()
+	shows, err := s.tmuxSession.TaskPaneShows(ctx, task, markers)
+	if err == nil && !shows {
+		if err = sleepContext(ctx, s.promptRunTiming.recheck()); err != nil {
+			return false, "", err
+		}
+		shows, err = s.tmuxSession.TaskPaneShows(ctx, task, markers)
+	}
+	switch {
+	case err != nil:
+		// The window cannot be read, so the hook status is all there is.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, "", ctxErr
+		}
+		if status != nil &&
+			(status.Phase == TaskStatusPhaseWorking || status.Phase == TaskStatusPhaseWorkingInBackground) {
+			return true, "session busy", nil
+		}
+		return false, "", nil
+	case shows:
+		return true, "session busy", nil
+	default:
+		return false, "", nil
+	}
+}
+
+// sendPromptToSession sends the prompt to the provider already running in the
+// Task's window and waits for it to take it. A prompt the session ignores,
+// because it was not ready for input or the paste went elsewhere, is a failed
+// run rather than a successful one nobody can see failing.
+func (s *service) sendPromptToSession(
+	ctx context.Context,
+	task *Task,
+	providerClient ProviderClient,
+	run promptRun,
+) (RunTaskPromptResult, error) {
+	sentAt := time.Now()
+	if err := s.tmuxSession.SubmitTaskPrompt(ctx, task, run.prompt); err != nil {
+		return RunTaskPromptResult{}, fmt.Errorf("send the prompt to the session: %w", err)
+	}
+
+	taken, err := s.awaitPromptSent(ctx, task, providerClient, sentAt)
+	if err != nil {
+		return RunTaskPromptResult{}, err
+	}
+	if !taken {
+		return promptRunFailed("the session didn't take the prompt"), nil
+	}
+	return promptRunStarted("sent to the running session"), nil
+}
+
+// awaitPromptSent waits until the session shows it took the prompt sent at
+// sentAt, within the run's bound, and reports whether it did. It did when a
+// status newer than the send says the provider is working on a turn, or has
+// finished one, or when the window shows a busy marker.
+func (s *service) awaitPromptSent(
+	ctx context.Context,
+	task *Task,
+	providerClient ProviderClient,
+	sentAt time.Time,
+) (bool, error) {
+	timing := s.promptRunTiming
+	deadline := time.Now().Add(timing.takeWait())
+	for {
+		status, err := s.tasks.LatestTaskStatus(ctx, task.ID)
+		if err == nil && promptSent(status, sentAt) {
+			return true, nil
+		}
+		// A window that cannot be read says nothing; the status may still.
+		if shows, err := s.tmuxSession.TaskPaneShows(ctx, task, providerClient.BusyMarkers()); err == nil && shows {
+			return true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return false, ctx.Err()
+		}
+		if err := sleepContext(ctx, timing.takePoll()); err != nil {
+			return false, err
+		}
+	}
+}
+
+// promptSent reports whether a status says the session took a prompt sent at
+// sentAt: it was reported after the send, and the provider is working on a
+// turn or finished one. A turn that ends before the status is looked at again
+// leaves only the Stop that ended it, which a session that was idle before the
+// send cannot have reported for anything else.
+func promptSent(status *TaskStatusUpdate, sentAt time.Time) bool {
+	if status == nil || !status.ObservedAt.After(sentAt) {
+		return false
+	}
+	switch status.Phase {
+	case TaskStatusPhaseWorking, TaskStatusPhaseWorkingInBackground:
+		return true
+	case TaskStatusPhaseWaitingForInput:
+		return status.RawEventName == HookEventStop || status.RawEventName == HookEventStopFailure
+	default:
+		return false
+	}
+}
+
+// startPromptRunSession starts the Task's provider on the prompt in its window.
+// replace says an idle session is running there, which is ended first.
+func (s *service) startPromptRunSession(
+	ctx context.Context,
+	task *Task,
+	providerClient ProviderClient,
+	run promptRun,
+	replace bool,
+) (RunTaskPromptResult, error) {
 	resumeSessionID := ""
 	if run.sessionMode == PromptRunSessionSame {
+		var err error
 		resumeSessionID, err = s.latestProviderSessionID(ctx, task)
 		if err != nil {
 			return RunTaskPromptResult{}, err
@@ -160,7 +378,7 @@ func (s *service) runTaskPrompt(ctx context.Context, task *Task, run promptRun) 
 	}
 
 	// Everything that can fail without touching the window comes first, so a
-	// failed run does not leave an idle session closed for nothing.
+	// failed run does not leave an idle session ended for nothing.
 	if err := providerClient.EnsureTaskSessionEnvironment(ctx, task.ProviderEnv); err != nil {
 		return RunTaskPromptResult{}, fmt.Errorf("ensure task session environment: %w", err)
 	}
@@ -187,11 +405,11 @@ func (s *service) runTaskPrompt(ctx context.Context, task *Task, run promptRun) 
 	// start belongs to that launch, not to the provider this run starts.
 	s.launcher.withdrawLatePrefill(task.ID)
 
-	// An idle provider's window is closed rather than typed into, so the run
-	// starts clean, with its own model, effort and permission mode.
-	if window.closeFirst {
-		if err := s.tmuxSession.CloseTaskWindow(ctx, task); err != nil {
-			return RunTaskPromptResult{}, fmt.Errorf("close the idle session: %w", err)
+	// An idle session is ended rather than typed into, so the run starts
+	// clean, with its own model, effort and permission mode.
+	if replace {
+		if err := s.tmuxSession.RespawnTaskPane(ctx, task); err != nil {
+			return RunTaskPromptResult{}, fmt.Errorf("end the idle session: %w", err)
 		}
 	}
 
@@ -205,14 +423,11 @@ func (s *service) runTaskPrompt(ctx context.Context, task *Task, run promptRun) 
 
 	switch {
 	case resumeSessionID != "":
-		return RunTaskPromptResult{
-			Outcome: PromptRunLaunched,
-			Detail:  "resumed " + shortSessionID(resumeSessionID),
-		}, nil
+		return promptRunStarted("resumed " + shortSessionID(resumeSessionID)), nil
 	case run.sessionMode == PromptRunSessionSame:
-		return RunTaskPromptResult{Outcome: PromptRunLaunched, Detail: "no previous session, started fresh"}, nil
+		return promptRunStarted("no previous session, started fresh"), nil
 	default:
-		return RunTaskPromptResult{Outcome: PromptRunLaunched, Detail: "started fresh"}, nil
+		return promptRunStarted("started fresh"), nil
 	}
 }
 
@@ -235,10 +450,8 @@ func (s *service) awaitPromptRunStarted(ctx context.Context, task *Task, launche
 		if !time.Now().Before(deadline) {
 			return
 		}
-		select {
-		case <-ctx.Done():
+		if sleepContext(ctx, interval) != nil {
 			return
-		case <-time.After(interval):
 		}
 	}
 }
@@ -247,7 +460,7 @@ func (s *service) awaitPromptRunStarted(ctx context.Context, task *Task, launche
 // launchedAt has taken the prompt: it is working, or has finished its turn,
 // after the launch. A session start does not say so, since a provider reports
 // it before it submits the prompt, and a resumed session reads as idle in
-// between; a run that looked then would close the provider it just started.
+// between; a run that looked then would end the provider it just started.
 // Nor does a provider that stopped, which can be the session before.
 func promptRunTaken(status *TaskStatusUpdate, launchedAt time.Time) bool {
 	if status == nil || !status.ObservedAt.After(launchedAt) || status.RawEventName == HookEventSessionStart {
@@ -261,102 +474,16 @@ func promptRunTaken(status *TaskStatusUpdate, launchedAt time.Time) bool {
 	}
 }
 
-// promptRunWindowState is what the Task's window allows a prompt run to do.
-type promptRunWindowState struct {
-	// busy, when not empty, is why the run must be skipped.
-	busy string
-	// closeFirst means an idle provider is running in the window and the
-	// window must be closed before the run is launched.
-	closeFirst bool
-}
-
-// promptRunWindow reads the Task's window and decides whether, and how, the
-// provider can be launched in it. It changes nothing.
-func (s *service) promptRunWindow(
-	ctx context.Context,
-	task *Task,
-	providerClient ProviderClient,
-) (promptRunWindowState, error) {
-	runtime, err := s.tmuxSession.InspectTaskSession(ctx, task)
-	if err != nil {
-		return promptRunWindowState{}, fmt.Errorf("inspect task session: %w", err)
+// sleepContext waits for d, or returns the context's error when it ends first.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	if !runtime.Exists {
-		return promptRunWindowState{}, nil
-	}
-
-	if !taskSessionRunningProvider(runtime, providerClient.TaskSessionCommandName()) {
-		return promptRunWindowState{busy: busyPaneReason(runtime)}, nil
-	}
-
-	// The status decides whether a window is closed, so it is read afresh: the
-	// cached view can be older than the hook event that made the provider ask
-	// for a permission.
-	status, err := s.observation.FreshTaskStatus(ctx, task.ID)
-	if err != nil {
-		return promptRunWindowState{}, fmt.Errorf("read task status: %w", err)
-	}
-	if status == nil {
-		return promptRunWindowState{busy: "status unknown"}, nil
-	}
-	switch status.Phase {
-	case TaskStatusPhaseWorking, TaskStatusPhaseWorkingInBackground:
-		interrupted, err := s.lastTurnInterrupted(ctx, task, providerClient)
-		if err != nil {
-			return promptRunWindowState{}, err
-		}
-		if !interrupted {
-			return promptRunWindowState{busy: "still working"}, nil
-		}
-	case TaskStatusPhaseWaitingForInput:
-		if status.RawEventName == HookEventNotification || status.RawEventName == HookEventPermissionRequest {
-			return promptRunWindowState{busy: "waiting on a permission prompt"}, nil
-		}
-	case TaskStatusPhaseStarting:
-	default:
-		return promptRunWindowState{busy: fmt.Sprintf("status %s unknown", status.Phase)}, nil
-	}
-	return promptRunWindowState{closeFirst: true}, nil
-}
-
-// lastTurnInterrupted asks the provider whether the user interrupted the last
-// turn of the Task's latest session, which no hook reports. Without a session
-// to ask about, the turn counts as running.
-func (s *service) lastTurnInterrupted(ctx context.Context, task *Task, providerClient ProviderClient) (bool, error) {
-	sessionID, err := s.latestProviderSessionID(ctx, task)
-	if err != nil || sessionID == "" {
-		return false, err
-	}
-	session, err := s.recordedProviderSession(ctx, task, sessionID)
-	if err != nil {
-		return false, err
-	}
-	interrupted, err := providerClient.LastTurnInterrupted(ctx, task, session)
-	if err != nil {
-		return false, fmt.Errorf("check whether the last turn was interrupted: %w", err)
-	}
-	return interrupted, nil
-}
-
-// recordedProviderSession is the Task's provider session as rig recorded it
-// from the provider's hooks, which carry where the provider keeps its
-// transcript, or just the session's identity when none was recorded.
-func (s *service) recordedProviderSession(
-	ctx context.Context,
-	task *Task,
-	sessionID string,
-) (TaskProviderSession, error) {
-	session := TaskProviderSession{TaskID: task.ID, Provider: task.Provider, ProviderSessionID: sessionID}
-	recorded, err := s.tasks.ListTaskProviderSessions(ctx, task.ID)
-	if err != nil {
-		return TaskProviderSession{}, fmt.Errorf("list provider sessions: %w", err)
-	}
-	for _, candidate := range latestProviderSessionsByID(recorded) {
-		if candidate.Provider == task.Provider && candidate.ProviderSessionID == sessionID {
-			return candidate, nil
-		}
-	}
-	return session, nil
 }
 
 // latestProviderSessionID is the Task's latest provider session, or "" when it
@@ -370,60 +497,6 @@ func (s *service) latestProviderSessionID(ctx context.Context, task *Task) (stri
 		return "", nil
 	}
 	return strings.TrimSpace(metadata.SessionID), nil
-}
-
-// busyPaneReason explains why a pane without the Task's provider cannot be
-// launched into, or is empty when it can: only a login shell waiting at its
-// prompt may be in it, and the process evidence must say so, or rig would type
-// the provider's command into a dev server, an editor or a script that reads
-// its input. A shell at its prompt has no child process, so anything it
-// started counts as running, a script run by "sh" or a nested "bash" as much
-// as "vim".
-func busyPaneReason(runtime TaskSessionRuntimeState) string {
-	shell := ""
-	for _, command := range runtime.ActiveCommands {
-		name := paneCommandName(command)
-		if name == "" {
-			continue
-		}
-		if !isLoginShell(name) {
-			return "pane is running " + name
-		}
-		shell = name
-	}
-	for _, command := range runtime.ChildCommands {
-		if name := paneCommandName(command); name != "" {
-			return "pane is running " + name
-		}
-	}
-	if runtime.ChildProcessEvidenceUnavailable {
-		if shell == "" {
-			return "pane state unknown"
-		}
-		return "pane is running " + shell + " and what it started cannot be seen"
-	}
-	return ""
-}
-
-// paneCommandName is the name of a command as the process list shows it: its base
-// name, without the "-" that marks a login shell.
-func paneCommandName(command string) string {
-	name := strings.TrimPrefix(filepath.Base(strings.TrimSpace(command)), "-")
-	if name == "." {
-		return ""
-	}
-	return name
-}
-
-// isLoginShell reports whether a command name, without any leading "-", is an
-// interactive shell the pane starts out with.
-func isLoginShell(name string) bool {
-	switch name {
-	case "zsh", "bash", "fish", "sh":
-		return true
-	default:
-		return false
-	}
 }
 
 // promptRunScript is the script the prompt wrapper runs. promptFile is its $0

@@ -134,12 +134,24 @@ type sessionClientState struct {
 	submitErr       error
 	onSubmit        func(*Task, string)
 	inspectState    TaskSessionRuntimeState
-	// viewed is whether a tmux client shows the task's window.
-	viewed              bool
-	viewedErr           error
-	viewedChecks        int
-	closeErr            error
-	closedTasks         []*Task
+	// paneShows are the answers TaskPaneShows gives, one per call and the last
+	// one again for every call after it; with none, the window shows nothing
+	// busy. paneChecks are the markers each call was given, guarded by mu.
+	paneShows      []paneShow
+	paneChecks     [][]string
+	paneCheckTimes []time.Time
+	// onPaneCheck runs at the start of every TaskPaneShows call, outside mu.
+	onPaneCheck func()
+	// submittedPrompts are the prompts sent to the provider in the task
+	// window; onSubmitPrompt runs for each, for example to make the provider
+	// report that it took one.
+	submittedPrompts []string
+	submitPromptErr  error
+	onSubmitPrompt   func(*Task, string)
+	// respawnErr fails RespawnTaskPane, and respawnedTasks are the tasks
+	// whose panes were respawned.
+	respawnErr          error
+	respawnedTasks      []*Task
 	batchInspectCalls   int
 	batchInspectActive  int
 	batchInspectMax     int
@@ -207,13 +219,15 @@ type providerClientState struct {
 	promptRunSpec     TaskSessionLaunchSpec
 	promptRunErr      error
 	promptRunLaunches []PromptRunLaunch
-	// interrupted is what the provider says of the last turn; interruptChecks
-	// are the IDs of the sessions it was asked about, and interruptedSessions
-	// the sessions as it was given them.
-	interrupted         bool
-	interruptedErr      error
-	interruptChecks     []string
-	interruptedSessions []TaskProviderSession
+	// busyMarkers are the texts the provider says only a running turn shows;
+	// without any, "esc to interrupt".
+	busyMarkers []string
+}
+
+// paneShow is one answer of TaskPaneShows.
+type paneShow struct {
+	shows bool
+	err   error
 }
 
 func (s *providerClientState) mockCommandName() string {
@@ -582,19 +596,42 @@ func configureTmuxSessionMock(client *MockTmuxSessionClient, state *sessionClien
 			return runtimeByTask, nil
 		},
 	).Maybe()
-	client.EXPECT().TaskWindowViewed(mock.Anything, mock.Anything).RunAndReturn(
-		func(_ context.Context, _ *Task) (bool, error) {
-			state.viewedChecks++
-			return state.viewed, state.viewedErr
+	client.EXPECT().TaskPaneShows(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, _ *Task, markers []string) (bool, error) {
+			if state.onPaneCheck != nil {
+				state.onPaneCheck()
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			call := len(state.paneChecks)
+			state.paneChecks = append(state.paneChecks, append([]string(nil), markers...))
+			state.paneCheckTimes = append(state.paneCheckTimes, time.Now())
+			if len(state.paneShows) == 0 {
+				return false, nil
+			}
+			answer := state.paneShows[min(call, len(state.paneShows)-1)]
+			return answer.shows, answer.err
 		},
 	).Maybe()
-	client.EXPECT().CloseTaskWindow(mock.Anything, mock.Anything).RunAndReturn(
+	client.EXPECT().SubmitTaskPrompt(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, task *Task, text string) error {
+			if state.events != nil {
+				*state.events = append(*state.events, "submit_task_prompt")
+			}
+			state.submittedPrompts = append(state.submittedPrompts, text)
+			if state.onSubmitPrompt != nil {
+				state.onSubmitPrompt(task, text)
+			}
+			return state.submitPromptErr
+		},
+	).Maybe()
+	client.EXPECT().RespawnTaskPane(mock.Anything, mock.Anything).RunAndReturn(
 		func(_ context.Context, task *Task) error {
 			if state.events != nil {
-				*state.events = append(*state.events, "close_task_window")
+				*state.events = append(*state.events, "respawn_task_pane")
 			}
-			state.closedTasks = append(state.closedTasks, cloneTask(task))
-			return state.closeErr
+			state.respawnedTasks = append(state.respawnedTasks, cloneTask(task))
+			return state.respawnErr
 		},
 	).Maybe()
 	client.EXPECT().DeleteTaskSession(mock.Anything, mock.Anything).RunAndReturn(
@@ -694,13 +731,12 @@ func configureProviderClientMock(client *MockProviderClient, state *providerClie
 			return TaskSessionLaunchSpec{Command: command, ReadyMarker: "›"}, nil
 		},
 	).Maybe()
-	client.EXPECT().LastTurnInterrupted(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
-		func(_ context.Context, _ *Task, session TaskProviderSession) (bool, error) {
-			state.interruptChecks = append(state.interruptChecks, session.ProviderSessionID)
-			state.interruptedSessions = append(state.interruptedSessions, session)
-			return state.interrupted, state.interruptedErr
-		},
-	).Maybe()
+	client.EXPECT().BusyMarkers().RunAndReturn(func() []string {
+		if len(state.busyMarkers) > 0 {
+			return state.busyMarkers
+		}
+		return []string{"esc to interrupt"}
+	}).Maybe()
 	client.EXPECT().TaskSessionCommandName().RunAndReturn(state.mockCommandName).Maybe()
 	client.EXPECT().ExitCommand().RunAndReturn(func() string {
 		if state.exitCommand != "" {

@@ -13,8 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// promptRunFixture is a ready Task whose pane is an idle shell, so that a
-// prompt run launches unless a test says otherwise.
+// promptRunFixture is a ready Task whose pane is a bare shell, so that a
+// prompt run launches the provider unless a test says otherwise. Its waits are
+// short.
 func promptRunFixture(t *testing.T) (*testTaskServiceHarness, *Task) {
 	t.Helper()
 
@@ -22,6 +23,13 @@ func promptRunFixture(t *testing.T) (*testTaskServiceHarness, *Task) {
 	task := readyTaskFixture()
 	svc.taskRepo.listTasks = []*Task{task}
 	svc.sessionClient.inspectState = idlePane()
+	svc.service.promptRunTiming = promptRunTiming{
+		recheckInterval: time.Millisecond,
+		takenWait:       40 * time.Millisecond,
+		takenPoll:       time.Millisecond,
+	}
+	// A launch does not wait for a provider that says nothing.
+	svc.launcher.providerSessionWait = 0
 	return svc, task
 }
 
@@ -39,34 +47,95 @@ func runPrompt(t *testing.T, svc *testTaskServiceHarness, input RunTaskPromptInp
 	return result
 }
 
-// setWindowedProvider makes the Task's provider run in its pane, with the
-// given latest status.
-func setWindowedProvider(svc *testTaskServiceHarness, status TaskStatusUpdate) {
+// runningProvider makes the Task's provider run in its pane, with the given
+// latest status; a zero status records none.
+func runningProvider(svc *testTaskServiceHarness, status TaskStatusUpdate) {
 	svc.sessionClient.inspectState = TaskSessionRuntimeState{
 		Exists:         true,
 		ActiveCommands: []string{"zsh", "codex"},
 	}
+	if status.Phase == "" {
+		return
+	}
 	status.TaskID = "task-1"
 	status.Provider = ProviderCodex
-	status.ObservedAt = time.Now().UTC()
+	status.ObservedAt = time.Now().UTC().Add(-time.Minute)
+	svc.taskRepo.mu.Lock()
+	defer svc.taskRepo.mu.Unlock()
 	svc.taskRepo.latestByTask["task-1"] = status
+}
+
+// idleProvider is a provider whose turn ended a minute ago.
+func idleProvider(svc *testTaskServiceHarness) {
+	runningProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
+}
+
+// reportStatus records a status as if a hook had just reported it.
+func reportStatus(svc *testTaskServiceHarness, status TaskStatusUpdate) {
+	status.TaskID = "task-1"
+	status.Provider = ProviderCodex
+	status.ObservedAt = time.Now().UTC().Add(time.Second)
+	svc.taskRepo.mu.Lock()
+	defer svc.taskRepo.mu.Unlock()
+	svc.taskRepo.latestByTask["task-1"] = status
+}
+
+// providerTakesPrompts makes the provider report a turn as soon as a prompt is
+// sent to it.
+func providerTakesPrompts(svc *testTaskServiceHarness) {
+	svc.sessionClient.onSubmitPrompt = func(*Task, string) {
+		reportStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking, RawEventName: HookEventUserPromptSubmit})
+	}
+}
+
+func requireNothingDone(t *testing.T, svc *testTaskServiceHarness) {
+	t.Helper()
+
+	require.Nil(t, svc.sessionClient.startedTask, "nothing is started")
+	require.Empty(t, svc.sessionClient.submittedPrompts, "nothing is sent")
+	require.Empty(t, svc.sessionClient.respawnedTasks, "nothing is ended")
+	require.Empty(t, svc.promptFiles.writes, "no prompt is written")
 }
 
 func requireSkipped(t *testing.T, svc *testTaskServiceHarness, result RunTaskPromptResult, detail string) {
 	t.Helper()
 
 	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunSkipped, Detail: detail}, result)
-	require.Nil(t, svc.sessionClient.startedTask, "a skipped run starts nothing")
-	require.Empty(t, svc.sessionClient.closedTasks, "a skipped run closes nothing")
-	require.Empty(t, svc.promptFiles.writes, "a skipped run writes no prompt")
+	requireNothingDone(t, svc)
 }
 
-func requireLaunched(t *testing.T, svc *testTaskServiceHarness, result RunTaskPromptResult, detail string) {
+func requireStarted(t *testing.T, svc *testTaskServiceHarness, result RunTaskPromptResult, detail string) {
 	t.Helper()
 
-	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunLaunched, Detail: detail}, result)
-	require.NotNil(t, svc.sessionClient.startedTask, "a launched run starts the session")
+	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunStarted, Detail: detail}, result)
+	require.NotNil(t, svc.sessionClient.startedTask, "a started run launches the provider")
+	require.Empty(t, svc.sessionClient.submittedPrompts, "a launch types nothing into the provider")
 }
+
+func requireSent(t *testing.T, svc *testTaskServiceHarness, result RunTaskPromptResult, prompt string) {
+	t.Helper()
+
+	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunStarted, Detail: "sent to the running session"}, result)
+	require.Equal(t, []string{prompt}, svc.sessionClient.submittedPrompts)
+	require.Nil(t, svc.sessionClient.startedTask, "the running session is not launched again")
+	require.Empty(t, svc.sessionClient.respawnedTasks, "the running session is not ended")
+	require.Empty(t, svc.promptFiles.writes, "a sent prompt needs no file")
+}
+
+func requireFailed(t *testing.T, result RunTaskPromptResult, detail string) {
+	t.Helper()
+
+	require.Equal(t, PromptRunFailed, result.Outcome)
+	require.Contains(t, result.Detail, detail)
+}
+
+func (s *sessionClientState) paneCheckCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.paneChecks)
+}
+
+// --- the Task
 
 func TestTaskServiceRunTaskPrompt_SkipsATaskThatIsNotReady(t *testing.T) {
 	for _, status := range []TaskCreationStatus{TaskCreationStatusCreating, TaskCreationStatusFailed} {
@@ -76,7 +145,7 @@ func TestTaskServiceRunTaskPrompt_SkipsATaskThatIsNotReady(t *testing.T) {
 
 			result := runPrompt(t, svc, RunTaskPromptInput{})
 
-			requireSkipped(t, svc, result, "skipped: task is not ready ("+string(status)+")")
+			requireSkipped(t, svc, result, "task is not ready ("+string(status)+")")
 		})
 	}
 }
@@ -87,7 +156,7 @@ func TestTaskServiceRunTaskPrompt_SkipsAShelvedTask(t *testing.T) {
 
 	result := runPrompt(t, svc, RunTaskPromptInput{})
 
-	requireSkipped(t, svc, result, "skipped: task is shelved")
+	requireSkipped(t, svc, result, "task is shelved")
 }
 
 func TestTaskServiceRunTaskPrompt_SkipsATaskThatDoesNotExist(t *testing.T) {
@@ -95,11 +164,12 @@ func TestTaskServiceRunTaskPrompt_SkipsATaskThatDoesNotExist(t *testing.T) {
 
 	result := runPrompt(t, svc, RunTaskPromptInput{TaskID: "task-404"})
 
-	requireSkipped(t, svc, result, "skipped: task not found")
+	requireSkipped(t, svc, result, "task not found")
 }
 
 func TestTaskServiceRunTaskPrompt_SkipsWhileAnotherOperationHoldsTheTask(t *testing.T) {
 	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
 
 	var result RunTaskPromptResult
 	err := svc.service.operations.Run(
@@ -112,11 +182,11 @@ func TestTaskServiceRunTaskPrompt_SkipsWhileAnotherOperationHoldsTheTask(t *test
 	)
 
 	require.NoError(t, err)
-	requireSkipped(t, svc, result, "skipped: another operation is running")
-	require.Zero(t, svc.sessionClient.viewedChecks, "the lock is taken before anything else is checked")
+	requireSkipped(t, svc, result, "another operation is running")
+	require.Zero(t, svc.sessionClient.paneCheckCount(), "the lock is taken before the window is looked at")
 }
 
-func TestTaskServiceRunTaskPrompt_HoldsTheTaskWhileItRuns(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_HoldsTheTaskWhileItLaunches(t *testing.T) {
 	svc, _ := promptRunFixture(t)
 	var duringRun error
 	svc.sessionClient.onStart = func(*Task) {
@@ -134,305 +204,478 @@ func TestTaskServiceRunTaskPrompt_HoldsTheTaskWhileItRuns(t *testing.T) {
 	require.Equal(t, "running a prompt", inProgress.Active.progressLabel())
 }
 
-func TestTaskServiceRunTaskPrompt_SkipsWhileTheUserIsViewingTheWindow(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_HoldsTheTaskWhileASentPromptIsBeingTaken(t *testing.T) {
 	svc, _ := promptRunFixture(t)
-	svc.sessionClient.viewed = true
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireSkipped(t, svc, result, "skipped: you're viewing it")
-}
-
-func TestTaskServiceRunTaskPrompt_ChecksViewingBeforeTouchingTheWindow(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	svc.sessionClient.viewed = true
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireSkipped(t, svc, result, "skipped: you're viewing it")
-}
-
-func TestTaskServiceRunTaskPrompt_ReturnsATmuxFailureAsAnError(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	svc.sessionClient.viewedErr = errors.New("tmux exploded")
-
-	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
-
-	require.ErrorContains(t, err, "tmux exploded")
-	require.Nil(t, svc.sessionClient.startedTask)
-}
-
-func TestTaskServiceRunTaskPrompt_LaunchesWhenTheWindowIsMissing(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	svc.sessionClient.inspectState = TaskSessionRuntimeState{}
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireLaunched(t, svc, result, "started fresh")
-	require.Empty(t, svc.sessionClient.closedTasks, "there is no window to close")
-}
-
-func TestTaskServiceRunTaskPrompt_ALaunchIntoAMissingWindowIgnoresStaleProcessEvidence(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	svc.sessionClient.inspectState = TaskSessionRuntimeState{
-		ActiveCommands:                  []string{"node"},
-		ChildProcessEvidenceUnavailable: true,
+	idleProvider(svc)
+	var duringRun error
+	svc.sessionClient.onSubmitPrompt = func(*Task, string) {
+		duringRun = svc.service.operations.Run(
+			t.Context(), "task-1", taskOperationRename, false, func(context.Context) error { return nil },
+		)
+		reportStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
 	}
 
-	result := runPrompt(t, svc, RunTaskPromptInput{})
+	runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
 
-	requireLaunched(t, svc, result, "started fresh")
+	require.ErrorIs(t, duringRun, ErrTaskOperationInProgress)
 }
 
-func TestTaskServiceRunTaskPrompt_LaunchesIntoABareShell(t *testing.T) {
-	for _, commands := range [][]string{
-		{"zsh"},
-		{"-zsh"},
-		{"bash", "-bash"},
-		{"/bin/zsh"},
-		{"fish"},
-		{"sh"},
-		nil,
-	} {
-		t.Run(commandsName(commands), func(t *testing.T) {
-			svc, _ := promptRunFixture(t)
-			svc.sessionClient.inspectState = TaskSessionRuntimeState{Exists: true, ActiveCommands: commands}
-
-			result := runPrompt(t, svc, RunTaskPromptInput{})
-
-			requireLaunched(t, svc, result, "started fresh")
-			require.Empty(t, svc.sessionClient.closedTasks, "a shell is not a provider session to close")
-		})
-	}
-}
-
-func commandsName(commands []string) string {
-	if len(commands) == 0 {
-		return "no commands"
-	}
-	name := ""
-	for _, command := range commands {
-		name += command + " "
-	}
-	return name
-}
-
-func TestTaskServiceRunTaskPrompt_SkipsAPaneRunningSomethingOtherThanAShell(t *testing.T) {
-	tests := []struct {
-		name     string
-		commands []string
-		detail   string
-	}{
-		{"dev server", []string{"node"}, "skipped: pane is running node"},
-		{"editor under a shell", []string{"zsh", "vim"}, "skipped: pane is running vim"},
-		{"a command by path", []string{"zsh", "/usr/bin/python3"}, "skipped: pane is running python3"},
-		{"a shell look-alike", []string{"zsh", "zshell"}, "skipped: pane is running zshell"},
-		{"another provider", []string{"zsh", "claude"}, "skipped: pane is running claude"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			svc, _ := promptRunFixture(t)
-			svc.sessionClient.inspectState = TaskSessionRuntimeState{Exists: true, ActiveCommands: tt.commands}
-
-			result := runPrompt(t, svc, RunTaskPromptInput{})
-
-			requireSkipped(t, svc, result, tt.detail)
-		})
-	}
-}
-
-func TestTaskServiceRunTaskPrompt_SkipsAShellWhoseChildrenCannotBeSeen(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	svc.sessionClient.inspectState = TaskSessionRuntimeState{
-		Exists:                          true,
-		ActiveCommands:                  []string{"zsh"},
-		ChildProcessEvidenceUnavailable: true,
-	}
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireSkipped(t, svc, result, "skipped: pane is running zsh and what it started cannot be seen")
-}
-
-func TestTaskServiceRunTaskPrompt_SkipsAPaneWithNoEvidenceAtAll(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	svc.sessionClient.inspectState = TaskSessionRuntimeState{Exists: true, ChildProcessEvidenceUnavailable: true}
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireSkipped(t, svc, result, "skipped: pane state unknown")
-}
-
-func TestTaskServiceRunTaskPrompt_SkipsWhileTheProviderIsWorking(t *testing.T) {
-	for _, phase := range []TaskStatusPhase{TaskStatusPhaseWorking, TaskStatusPhaseWorkingInBackground} {
-		t.Run(string(phase), func(t *testing.T) {
-			svc, _ := promptRunFixture(t)
-			setWindowedProvider(svc, TaskStatusUpdate{Phase: phase, RawEventName: HookEventPostToolUse})
-			svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
-				TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
-			}
-
-			result := runPrompt(t, svc, RunTaskPromptInput{})
-
-			requireSkipped(t, svc, result, "skipped: still working")
-			require.Equal(t, []string{"sess-1"}, svc.providerRepo.interruptChecks,
-				"the provider is asked about the session the status belongs to")
-		})
-	}
-}
-
-func TestTaskServiceRunTaskPrompt_SkipsAWorkingProviderWithNoSessionToAskAbout(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireSkipped(t, svc, result, "skipped: still working")
-	require.Empty(t, svc.providerRepo.interruptChecks)
-}
-
-func TestTaskServiceRunTaskPrompt_IgnoresAnInterruptionOfAnotherProvidersSession(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
-	svc.providerRepo.interrupted = true
-	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
-		TaskID: "task-1", Provider: ProviderClaude, SessionID: "claude-sess",
-	}
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireSkipped(t, svc, result, "skipped: still working")
-	require.Empty(t, svc.providerRepo.interruptChecks)
-}
-
-func TestTaskServiceRunTaskPrompt_TreatsAnInterruptedWorkingProviderAsIdle(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking, RawEventName: HookEventPreToolUse})
-	svc.providerRepo.interrupted = true
-	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
-		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
-	}
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireLaunched(t, svc, result, "started fresh")
-	require.Equal(t, []string{"sess-1"}, svc.providerRepo.interruptChecks)
-	require.Len(t, svc.sessionClient.closedTasks, 1)
-	require.Equal(t, []string{"ensure_task_session_environment", "close_task_window", "start_task_session"}, svc.events,
-		"the idle session is closed before the run starts")
-}
-
-func TestTaskServiceRunTaskPrompt_ReturnsAFailedInterruptionCheckAsAnError(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
-	svc.providerRepo.interruptedErr = errors.New("transcript unreadable")
-	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
-		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
-	}
-
-	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
-
-	require.ErrorContains(t, err, "transcript unreadable")
-	require.Nil(t, svc.sessionClient.startedTask)
-	require.Empty(t, svc.sessionClient.closedTasks)
-}
-
-func TestTaskServiceRunTaskPrompt_SkipsAProviderWaitingOnAPermissionPrompt(t *testing.T) {
-	for _, event := range []string{HookEventNotification, HookEventPermissionRequest} {
-		t.Run(event, func(t *testing.T) {
-			svc, _ := promptRunFixture(t)
-			setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: event})
-
-			result := runPrompt(t, svc, RunTaskPromptInput{})
-
-			requireSkipped(t, svc, result, "skipped: waiting on a permission prompt")
-		})
-	}
-}
-
-func TestTaskServiceRunTaskPrompt_ClosesAnIdleSessionBeforeLaunching(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_ChecksTheTaskAgainOnceItHoldsTheLock(t *testing.T) {
 	tests := []struct {
 		name   string
-		status TaskStatusUpdate
+		change func(svc *testTaskServiceHarness, task *Task)
+		skip   string
+		launch func(t *testing.T, svc *testTaskServiceHarness)
 	}{
-		{"turn ended", TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop}},
-		{"turn failed", TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStopFailure}},
-		{"resumed", TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventSessionStart}},
-		{"starting", TaskStatusUpdate{Phase: TaskStatusPhaseStarting, RawEventName: HookEventSessionStart}},
+		{
+			name:   "shelved",
+			change: func(_ *testTaskServiceHarness, task *Task) { task.ShelvedAt = time.Now() },
+			skip:   "task is shelved",
+		},
+		{
+			name:   "deleted",
+			change: func(svc *testTaskServiceHarness, _ *Task) { svc.taskRepo.listTasks = nil },
+			skip:   "task not found",
+		},
+		{
+			name:   "no longer ready",
+			change: func(_ *testTaskServiceHarness, task *Task) { task.CreationStatus = TaskCreationStatusFailed },
+			skip:   "task is not ready (failed)",
+		},
+		{
+			name:   "renamed",
+			change: func(_ *testTaskServiceHarness, task *Task) { task.TmuxSession = "renamed_session" },
+			launch: func(t *testing.T, svc *testTaskServiceHarness) {
+				require.Equal(t, "renamed_session", svc.sessionClient.startedTask.TmuxSession,
+					"the session the lock found, not the one read before it")
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			svc, task := promptRunFixture(t)
-			task.TmuxWindow = "s2"
-			setWindowedProvider(svc, tt.status)
+			// The first read of the task is the look before the lock; the
+			// second is the run's own, with the lock held.
+			svc.taskRepo.onListTasks = func(call int) {
+				if call == 2 {
+					tt.change(svc, task)
+				}
+			}
 
 			result := runPrompt(t, svc, RunTaskPromptInput{})
 
-			requireLaunched(t, svc, result, "started fresh")
-			require.Len(t, svc.sessionClient.closedTasks, 1)
-			require.Equal(t, "s2", svc.sessionClient.closedTasks[0].TmuxWindow, "the task's own window")
-			require.Equal(
-				t,
-				[]string{"ensure_task_session_environment", "close_task_window", "start_task_session"},
-				svc.events,
-			)
+			if tt.skip != "" {
+				requireSkipped(t, svc, result, tt.skip)
+				return
+			}
+			requireStarted(t, svc, result, "started fresh")
+			tt.launch(t, svc)
 		})
 	}
 }
 
-func TestTaskServiceRunTaskPrompt_SkipsAStatusItDoesNotKnow(t *testing.T) {
-	t.Run("stopped", func(t *testing.T) {
-		svc, _ := promptRunFixture(t)
-		setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseStopped, RawEventName: HookEventSessionEnd})
+// --- is the session active
 
-		result := runPrompt(t, svc, RunTaskPromptInput{})
+func TestTaskServiceRunTaskPrompt_SkipsWhileTheWindowShowsABusyMarker(t *testing.T) {
+	tests := []struct {
+		name  string
+		shows []paneShow
+	}{
+		{"on the first look", []paneShow{{shows: true}}},
+		{"on the second look only", []paneShow{{shows: false}, {shows: true}}},
+	}
+	for _, mode := range []PromptRunSessionMode{PromptRunSessionNew, PromptRunSessionSame} {
+		for _, tt := range tests {
+			t.Run(string(mode)+" "+tt.name, func(t *testing.T) {
+				svc, _ := promptRunFixture(t)
+				idleProvider(svc)
+				svc.sessionClient.paneShows = tt.shows
 
-		requireSkipped(t, svc, result, "skipped: status stopped unknown")
-	})
-	t.Run("none recorded", func(t *testing.T) {
-		svc, _ := promptRunFixture(t)
-		svc.sessionClient.inspectState = TaskSessionRuntimeState{Exists: true, ActiveCommands: []string{"zsh", "codex"}}
+				result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: mode})
 
-		result := runPrompt(t, svc, RunTaskPromptInput{})
-
-		requireSkipped(t, svc, result, "skipped: status unknown")
-	})
+				requireSkipped(t, svc, result, "session busy")
+				require.Equal(t, [][]string{{"esc to interrupt"}}, svc.sessionClient.paneChecks[:1],
+					"the window is searched for the provider's own markers")
+			})
+		}
+	}
 }
 
-func TestTaskServiceRunTaskPrompt_DoesNotCloseTheWindowWhenTheRunCannotBeBuilt(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_AskTheProviderWhichMarkersShowABusyTurn(t *testing.T) {
 	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
-	svc.providerRepo.promptRunErr = errors.New("not supported by codex")
+	idleProvider(svc)
+	svc.providerRepo.busyMarkers = []string{"working…", "esc to stop"}
+	svc.sessionClient.paneShows = []paneShow{{shows: true}}
 
-	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
+	runPrompt(t, svc, RunTaskPromptInput{})
 
-	require.ErrorContains(t, err, "not supported by codex")
-	require.Empty(t, svc.sessionClient.closedTasks)
-	require.Nil(t, svc.sessionClient.startedTask)
+	require.Equal(t, []string{"working…", "esc to stop"}, svc.sessionClient.paneChecks[0])
 }
 
-func TestTaskServiceRunTaskPrompt_DoesNotLaunchWhenTheWindowCannotBeClosed(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_LooksAtTheWindowTwiceAnIntervalApart(t *testing.T) {
 	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
-	svc.sessionClient.closeErr = errors.New("processes did not exit")
+	idleProvider(svc)
+	const interval = 40 * time.Millisecond
+	svc.service.promptRunTiming.recheckInterval = interval
 
-	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
+	result := runPrompt(t, svc, RunTaskPromptInput{})
 
-	require.ErrorContains(t, err, "processes did not exit")
-	require.Nil(t, svc.sessionClient.startedTask)
+	requireStarted(t, svc, result, "started fresh")
+	svc.sessionClient.mu.Lock()
+	defer svc.sessionClient.mu.Unlock()
+	require.Len(t, svc.sessionClient.paneCheckTimes, 2, "a window that looks idle is looked at again, once")
+	require.GreaterOrEqual(t, svc.sessionClient.paneCheckTimes[1].Sub(svc.sessionClient.paneCheckTimes[0]), interval)
 }
 
-func TestTaskServiceRunTaskPrompt_ReturnsALaunchFailureAsAnError(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_RunsWhenTheStatusSaysWorkingButTheWindowShowsNothing(t *testing.T) {
+	for _, phase := range []TaskStatusPhase{TaskStatusPhaseWorking, TaskStatusPhaseWorkingInBackground} {
+		t.Run(string(phase)+" new", func(t *testing.T) {
+			svc, _ := promptRunFixture(t)
+			runningProvider(svc, TaskStatusUpdate{Phase: phase, RawEventName: HookEventPostToolUse})
+
+			result := runPrompt(t, svc, RunTaskPromptInput{})
+
+			requireStarted(t, svc, result, "started fresh")
+			require.Len(t, svc.sessionClient.respawnedTasks, 1, "the stale session is ended")
+		})
+		t.Run(string(phase)+" same", func(t *testing.T) {
+			svc, _ := promptRunFixture(t)
+			runningProvider(svc, TaskStatusUpdate{Phase: phase, RawEventName: HookEventPostToolUse})
+			providerTakesPrompts(svc)
+
+			result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+			requireSent(t, svc, result, "triage the open issues")
+		})
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_FallsBackToTheHookStatusWhenTheWindowCannotBeRead(t *testing.T) {
+	broken := errors.New("tmux capture failed")
+	looks := map[string][]paneShow{
+		"first look fails":  {{err: broken}},
+		"second look fails": {{shows: false}, {err: broken}},
+		"every look fails":  {{err: broken}, {err: broken}},
+	}
+	for name, shows := range looks {
+		for _, phase := range []TaskStatusPhase{TaskStatusPhaseWorking, TaskStatusPhaseWorkingInBackground} {
+			t.Run(name+" "+string(phase), func(t *testing.T) {
+				svc, _ := promptRunFixture(t)
+				runningProvider(svc, TaskStatusUpdate{Phase: phase, RawEventName: HookEventPostToolUse})
+				svc.sessionClient.paneShows = shows
+
+				result := runPrompt(t, svc, RunTaskPromptInput{})
+
+				requireSkipped(t, svc, result, "session busy")
+			})
+		}
+		t.Run(name+" idle", func(t *testing.T) {
+			svc, _ := promptRunFixture(t)
+			idleProvider(svc)
+			svc.sessionClient.paneShows = shows
+
+			result := runPrompt(t, svc, RunTaskPromptInput{})
+
+			requireStarted(t, svc, result, "started fresh")
+		})
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_ACancelledLookAtTheWindowIsAnErrorNotAGuess(t *testing.T) {
 	svc, _ := promptRunFixture(t)
-	svc.sessionClient.startErr = errors.New("tmux refused")
+	// The hook status would have the session busy, and so skipped.
+	runningProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking, RawEventName: HookEventPostToolUse})
+	ctx, cancel := context.WithCancel(t.Context())
+	svc.sessionClient.onPaneCheck = cancel
+	svc.sessionClient.paneShows = []paneShow{{err: context.Canceled}}
 
-	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
+	_, err := svc.service.RunTaskPrompt(ctx, RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
 
-	require.ErrorContains(t, err, "tmux refused")
+	require.ErrorIs(t, err, context.Canceled)
+	requireNothingDone(t, svc)
 }
 
-func TestTaskServiceRunTaskPrompt_SameResumesTheLatestSession(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_RunsWhenTheWindowCannotBeReadAndNoStatusWasRecorded(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	runningProvider(svc, TaskStatusUpdate{})
+	svc.sessionClient.paneShows = []paneShow{{err: errors.New("tmux capture failed")}}
+
+	result := runPrompt(t, svc, RunTaskPromptInput{})
+
+	requireStarted(t, svc, result, "started fresh")
+}
+
+func TestTaskServiceRunTaskPrompt_SkipsAProviderWaitingOnAPermissionPrompt(t *testing.T) {
+	for _, event := range []string{HookEventNotification, HookEventPermissionRequest} {
+		for _, mode := range []PromptRunSessionMode{PromptRunSessionNew, PromptRunSessionSame} {
+			t.Run(event+" "+string(mode), func(t *testing.T) {
+				svc, _ := promptRunFixture(t)
+				runningProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: event})
+
+				result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: mode})
+
+				requireSkipped(t, svc, result, "waiting on a permission prompt")
+				require.Zero(t, svc.sessionClient.paneCheckCount(), "a permission prompt needs no second opinion")
+			})
+		}
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_ATurnThatEndedIsNotAPermissionPrompt(t *testing.T) {
+	for _, event := range []string{HookEventStop, HookEventStopFailure, HookEventSessionStart} {
+		t.Run(event, func(t *testing.T) {
+			svc, _ := promptRunFixture(t)
+			runningProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: event})
+
+			result := runPrompt(t, svc, RunTaskPromptInput{})
+
+			requireStarted(t, svc, result, "started fresh")
+		})
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_OnlyAWaitingStatusIsAPermissionPrompt(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	// A status that kept the name of the event that raised it after the
+	// provider moved on.
+	runningProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking, RawEventName: HookEventNotification})
+
+	result := runPrompt(t, svc, RunTaskPromptInput{})
+
+	requireStarted(t, svc, result, "started fresh")
+}
+
+func TestTaskServiceRunTaskPrompt_ARunningProviderWithNoStatusRecordedIsNotActive(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	runningProvider(svc, TaskStatusUpdate{})
+	providerTakesPrompts(svc)
+
+	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+	requireSent(t, svc, result, "triage the open issues")
+}
+
+func TestTaskServiceRunTaskPrompt_ADeadProvidersLastPermissionPromptDoesNotBlockTheRun(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	// The pane is a bare shell: the provider that asked is gone.
+	setPromptRunStatus(
+		svc,
+		TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventPermissionRequest},
+	)
+	svc.sessionClient.paneShows = []paneShow{{shows: true}}
+
+	result := runPrompt(t, svc, RunTaskPromptInput{})
+
+	requireStarted(t, svc, result, "started fresh")
+	require.Zero(t, svc.sessionClient.paneCheckCount(), "there is no session to look at")
+}
+
+func TestTaskServiceRunTaskPrompt_ReadsTheStatusAfresh(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	// Something just looked at the status, so the observer holds a view of it.
+	status, err := svc.service.LatestTaskStatus(t.Context(), "task-1")
+	require.NoError(t, err)
+	require.Equal(t, HookEventStop, status.RawEventName)
+	// Then the provider asks for a permission.
+	svc.taskRepo.mu.Lock()
+	svc.taskRepo.latestByTask["task-1"] = TaskStatusUpdate{
+		TaskID:       "task-1",
+		Provider:     ProviderCodex,
+		Phase:        TaskStatusPhaseWaitingForInput,
+		RawEventName: HookEventPermissionRequest,
+		ObservedAt:   time.Now().UTC().Add(time.Second),
+	}
+	svc.taskRepo.mu.Unlock()
+
+	result := runPrompt(t, svc, RunTaskPromptInput{})
+
+	requireSkipped(t, svc, result, "waiting on a permission prompt")
+}
+
+// --- same
+
+func TestTaskServiceRunTaskPrompt_SameSendsThePromptToTheRunningSession(t *testing.T) {
+	svc, task := promptRunFixture(t)
+	task.TmuxWindow = "s2"
+	idleProvider(svc)
+	providerTakesPrompts(svc)
+	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
+		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
+	}
+	prompt := "triage the issues\n\n- first\n- second\n"
+
+	result := runPrompt(t, svc, RunTaskPromptInput{Prompt: prompt, SessionMode: PromptRunSessionSame})
+
+	requireSent(t, svc, result, prompt)
+	require.Equal(t, []string{"submit_task_prompt"}, svc.events, "nothing but the prompt reaches the window")
+}
+
+func TestTaskServiceRunTaskPrompt_SameConfirmsThePromptWasTaken(t *testing.T) {
+	tests := []struct {
+		name  string
+		taken func(svc *testTaskServiceHarness)
+	}{
+		{"working", func(svc *testTaskServiceHarness) {
+			reportStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking, RawEventName: HookEventUserPromptSubmit})
+		}},
+		{"working in the background", func(svc *testTaskServiceHarness) {
+			reportStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorkingInBackground, RawEventName: HookEventStop})
+		}},
+		{"a turn so short only its end was seen", func(svc *testTaskServiceHarness) {
+			reportStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
+		}},
+		{"a turn that failed", func(svc *testTaskServiceHarness) {
+			reportStatus(
+				svc,
+				TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStopFailure},
+			)
+		}},
+		{"the window shows the busy marker", func(svc *testTaskServiceHarness) {
+			svc.sessionClient.mu.Lock()
+			defer svc.sessionClient.mu.Unlock()
+			svc.sessionClient.paneShows = []paneShow{{shows: true}}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _ := promptRunFixture(t)
+			idleProvider(svc)
+			svc.sessionClient.onSubmitPrompt = func(*Task, string) { tt.taken(svc) }
+
+			result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+			requireSent(t, svc, result, "triage the open issues")
+		})
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_SameFailsWhenTheSessionDoesNotTakeThePrompt(t *testing.T) {
+	tests := []struct {
+		name   string
+		report func(svc *testTaskServiceHarness)
+	}{
+		{"nothing is reported", func(*testTaskServiceHarness) {}},
+		{"only the status from before the send", func(svc *testTaskServiceHarness) {
+			svc.taskRepo.mu.Lock()
+			defer svc.taskRepo.mu.Unlock()
+			svc.taskRepo.latestByTask["task-1"] = TaskStatusUpdate{
+				TaskID: "task-1", Provider: ProviderCodex, Phase: TaskStatusPhaseWorking,
+				RawEventName: HookEventPostToolUse, ObservedAt: time.Now().UTC().Add(-time.Second),
+			}
+		}},
+		{"a session start is not a prompt", func(svc *testTaskServiceHarness) {
+			reportStatus(
+				svc,
+				TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventSessionStart},
+			)
+		}},
+		{"a permission prompt is not the prompt taken", func(svc *testTaskServiceHarness) {
+			reportStatus(
+				svc,
+				TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventNotification},
+			)
+		}},
+		{"the session ended", func(svc *testTaskServiceHarness) {
+			reportStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseStopped, RawEventName: HookEventSessionEnd})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _ := promptRunFixture(t)
+			idleProvider(svc)
+			svc.sessionClient.onSubmitPrompt = func(*Task, string) { tt.report(svc) }
+
+			result, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{
+				TaskID: "task-1", Prompt: "triage", SessionMode: PromptRunSessionSame,
+			})
+
+			require.NoError(t, err, "a prompt that is not taken is a failed run, not an error")
+			require.Equal(t, RunTaskPromptResult{
+				Outcome: PromptRunFailed, Detail: "the session didn't take the prompt",
+			}, result)
+			require.Equal(t, []string{"triage"}, svc.sessionClient.submittedPrompts)
+		})
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_SameWaitsForThePromptToBeTaken(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	svc.service.promptRunTiming.takenWait = 10 * time.Second
+	svc.sessionClient.onSubmitPrompt = func(*Task, string) {
+		go func() {
+			time.Sleep(30 * time.Millisecond)
+			reportStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking, RawEventName: HookEventUserPromptSubmit})
+		}()
+	}
+
+	started := time.Now()
+	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+	requireSent(t, svc, result, "triage the open issues")
+	require.GreaterOrEqual(t, time.Since(started), 30*time.Millisecond, "the run waited for the provider")
+}
+
+func TestTaskServiceRunTaskPrompt_SameCountsAStatusReportedWhileThePromptIsStillBeingSent(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	// The hook fires as soon as Enter is pressed, which is before the send
+	// returns.
+	svc.sessionClient.onSubmitPrompt = func(*Task, string) {
+		time.Sleep(2 * time.Millisecond)
+		svc.taskRepo.mu.Lock()
+		defer svc.taskRepo.mu.Unlock()
+		svc.taskRepo.latestByTask["task-1"] = TaskStatusUpdate{
+			TaskID: "task-1", Provider: ProviderCodex, Phase: TaskStatusPhaseWorking,
+			RawEventName: HookEventUserPromptSubmit, ObservedAt: time.Now().UTC(),
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+	requireSent(t, svc, result, "triage the open issues")
+}
+
+func TestTaskServiceRunTaskPrompt_SameWaitsForThePromptAtTheConfiguredPace(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	svc.service.promptRunTiming.takenWait = 60 * time.Millisecond
+	svc.service.promptRunTiming.takenPoll = 20 * time.Millisecond
+
+	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+	requireFailed(t, result, "the session didn't take the prompt")
+	// Two looks decide the session is idle; the rest are polls of the wait.
+	require.LessOrEqual(t, svc.sessionClient.paneCheckCount(), 2+60/20+2, "the wait polls, it does not spin")
+	require.GreaterOrEqual(t, svc.sessionClient.paneCheckCount(), 2+2, "the wait polls more than once")
+}
+
+func TestPromptRunTiming_DefaultsAreTheDocumentedOnes(t *testing.T) {
+	var timing promptRunTiming
+
+	require.Equal(t, time.Second, timing.recheck(), "the two looks at the window are about a second apart")
+	require.Equal(t, 15*time.Second, timing.takeWait(), "a session has fifteen seconds to take the prompt")
+	require.Equal(t, 250*time.Millisecond, timing.takePoll())
+
+	timing = promptRunTiming{recheckInterval: time.Millisecond, takenWait: time.Minute, takenPoll: time.Hour}
+	require.Equal(t, time.Millisecond, timing.recheck())
+	require.Equal(t, time.Minute, timing.takeWait())
+	require.Equal(t, time.Hour, timing.takePoll())
+}
+
+func TestTaskServiceRunTaskPrompt_SameFailsWhenThePromptCannotBeSent(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	svc.sessionClient.submitPromptErr = errors.New("tmux paste failed")
+
+	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+	requireFailed(t, result, "tmux paste failed")
+}
+
+func TestTaskServiceRunTaskPrompt_SameLaunchesWithTheLastConversationWhenNoProviderRuns(t *testing.T) {
 	svc, _ := promptRunFixture(t)
 	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
 		TaskID: "task-1", Provider: ProviderCodex, SessionID: "3f2a9c1e-77aa-4c1b-9d00-0123456789ab",
@@ -440,19 +683,30 @@ func TestTaskServiceRunTaskPrompt_SameResumesTheLatestSession(t *testing.T) {
 
 	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
 
-	requireLaunched(t, svc, result, "resumed 3f2a…")
+	requireStarted(t, svc, result, "resumed 3f2a…")
 	require.Equal(t, "3f2a9c1e-77aa-4c1b-9d00-0123456789ab", svc.providerRepo.promptRunLaunches[0].ResumeSessionID)
 	require.Contains(t, svc.sessionClient.startedLaunch.Command, "3f2a9c1e-77aa-4c1b-9d00-0123456789ab",
 		"the resume id reaches the launched argv")
+	require.Empty(t, svc.sessionClient.respawnedTasks, "there is no session to end")
+	require.Zero(t, svc.sessionClient.paneCheckCount(), "there is no session to look at")
 }
 
-func TestTaskServiceRunTaskPrompt_SameWithoutAPreviousSessionStartsFresh(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_SameWithoutAPreviousConversationStartsFresh(t *testing.T) {
 	svc, _ := promptRunFixture(t)
 
 	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
 
-	requireLaunched(t, svc, result, "no previous session, started fresh")
+	requireStarted(t, svc, result, "no previous session, started fresh")
 	require.Empty(t, svc.providerRepo.promptRunLaunches[0].ResumeSessionID)
+}
+
+func TestTaskServiceRunTaskPrompt_SameLaunchesWhenTheWindowIsMissing(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	svc.sessionClient.inspectState = TaskSessionRuntimeState{}
+
+	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
+
+	requireStarted(t, svc, result, "no previous session, started fresh")
 }
 
 func TestTaskServiceRunTaskPrompt_SameIgnoresAnotherProvidersSession(t *testing.T) {
@@ -463,13 +717,51 @@ func TestTaskServiceRunTaskPrompt_SameIgnoresAnotherProvidersSession(t *testing.
 
 	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionSame})
 
-	requireLaunched(t, svc, result, "no previous session, started fresh")
+	requireStarted(t, svc, result, "no previous session, started fresh")
 	require.Empty(t, svc.providerRepo.promptRunLaunches[0].ResumeSessionID)
 	require.NotContains(t, svc.sessionClient.startedLaunch.Command, "claude-session")
 }
 
-func TestTaskServiceRunTaskPrompt_NewNeverResumes(t *testing.T) {
+// --- new
+
+func TestTaskServiceRunTaskPrompt_NewEndsAnIdleSessionThenLaunches(t *testing.T) {
+	svc, task := promptRunFixture(t)
+	task.TmuxWindow = "s2"
+	idleProvider(svc)
+	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
+		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
+	}
+
+	result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: PromptRunSessionNew})
+
+	requireStarted(t, svc, result, "started fresh")
+	require.Len(t, svc.sessionClient.respawnedTasks, 1)
+	require.Equal(t, "s2", svc.sessionClient.respawnedTasks[0].TmuxWindow, "the task's own window")
+	require.Equal(t, []string{"ensure_task_session_environment", "respawn_task_pane", "start_task_session"}, svc.events,
+		"the pane is respawned, then the provider is started in it")
+	require.Empty(t, svc.providerRepo.promptRunLaunches[0].ResumeSessionID, "a new session never resumes")
+}
+
+func TestTaskServiceRunTaskPrompt_NewLaunchesStraightIntoAPaneWithoutTheProvider(t *testing.T) {
+	for _, state := range []TaskSessionRuntimeState{
+		idlePane(),
+		{},
+		{Exists: true, ActiveCommands: []string{"zsh", "vim"}},
+	} {
+		svc, _ := promptRunFixture(t)
+		svc.sessionClient.inspectState = state
+
+		result := runPrompt(t, svc, RunTaskPromptInput{})
+
+		requireStarted(t, svc, result, "started fresh")
+		require.Empty(t, svc.sessionClient.respawnedTasks, "there is no provider session to end")
+		require.Equal(t, []string{"ensure_task_session_environment", "start_task_session"}, svc.events)
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_NewNeverResumesOrSendsToARunningSession(t *testing.T) {
 	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
 	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
 		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
 	}
@@ -478,12 +770,101 @@ func TestTaskServiceRunTaskPrompt_NewNeverResumes(t *testing.T) {
 		svc.sessionClient.startedTask = nil
 		result := runPrompt(t, svc, RunTaskPromptInput{SessionMode: mode})
 
-		requireLaunched(t, svc, result, "started fresh")
+		requireStarted(t, svc, result, "started fresh")
 	}
 	for _, launch := range svc.providerRepo.promptRunLaunches {
 		require.Empty(t, launch.ResumeSessionID)
 	}
 }
+
+// --- failures
+
+func TestTaskServiceRunTaskPrompt_ALaunchThatFailsIsAFailedRunNotAnError(t *testing.T) {
+	tests := []struct {
+		name   string
+		break_ func(svc *testTaskServiceHarness)
+		detail string
+	}{
+		{"the window cannot be inspected", func(svc *testTaskServiceHarness) {
+			svc.sessionClient.inspectErr = errors.New("tmux exploded")
+		}, "tmux exploded"},
+		{"the session cannot be started", func(svc *testTaskServiceHarness) {
+			svc.sessionClient.startErr = errors.New("tmux refused")
+		}, "tmux refused"},
+		{"the prompt cannot be written", func(svc *testTaskServiceHarness) {
+			svc.promptFiles.err = errors.New("disk full")
+		}, "disk full"},
+		{"the provider cannot build the launch", func(svc *testTaskServiceHarness) {
+			svc.providerRepo.promptRunErr = errors.New("accept_edits is not supported by codex")
+		}, "not supported by codex"},
+		{"the provider environment cannot be ensured", func(svc *testTaskServiceHarness) {
+			svc.providerRepo.sessionEnvErr = errors.New("cannot write the hooks")
+		}, "cannot write the hooks"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _ := promptRunFixture(t)
+			tt.break_(svc)
+
+			result, err := svc.service.RunTaskPrompt(
+				t.Context(),
+				RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"},
+			)
+
+			require.NoError(t, err)
+			requireFailed(t, result, tt.detail)
+		})
+	}
+}
+
+func TestTaskServiceRunTaskPrompt_DoesNotEndTheSessionWhenTheRunCannotBeBuilt(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	svc.providerRepo.promptRunErr = errors.New("not supported by codex")
+
+	result := runPrompt(t, svc, RunTaskPromptInput{})
+
+	requireFailed(t, result, "not supported by codex")
+	require.Empty(t, svc.sessionClient.respawnedTasks)
+	require.Nil(t, svc.sessionClient.startedTask)
+}
+
+func TestTaskServiceRunTaskPrompt_DoesNotLaunchWhenTheSessionCannotBeEnded(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	svc.sessionClient.respawnErr = errors.New("processes did not exit")
+
+	result := runPrompt(t, svc, RunTaskPromptInput{})
+
+	requireFailed(t, result, "processes did not exit")
+	require.Nil(t, svc.sessionClient.startedTask)
+}
+
+func TestTaskServiceRunTaskPrompt_ACancelledRunIsAnErrorNotAFailedRun(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	svc.service.promptRunTiming.takenWait = time.Minute
+	ctx, cancel := context.WithCancel(t.Context())
+	svc.sessionClient.onSubmitPrompt = func(*Task, string) { cancel() }
+
+	_, err := svc.service.RunTaskPrompt(ctx, RunTaskPromptInput{
+		TaskID: "task-1", Prompt: "triage", SessionMode: PromptRunSessionSame,
+	})
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestTaskServiceRunTaskPrompt_ReturnsAnUnreadableTaskAsAnError(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	svc.taskRepo.listErr = errors.New("database is locked")
+
+	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
+
+	require.ErrorContains(t, err, "database is locked")
+	requireNothingDone(t, svc)
+}
+
+// --- the launch
 
 func TestTaskServiceRunTaskPrompt_LaunchesTheProvidersArgvThroughThePromptWrapper(t *testing.T) {
 	svc, _ := promptRunFixture(t)
@@ -494,7 +875,7 @@ func TestTaskServiceRunTaskPrompt_LaunchesTheProvidersArgvThroughThePromptWrappe
 
 	result := runPrompt(t, svc, RunTaskPromptInput{Prompt: "- fix everything"})
 
-	requireLaunched(t, svc, result, "started fresh")
+	requireStarted(t, svc, result, "started fresh")
 	require.Equal(t, []string{
 		"sh", "-c", `p=$(cat "$0" && printf x) || exit; exec "$@" -- "${p%x}"`,
 		"/data/prompts/task-1.txt",
@@ -504,7 +885,7 @@ func TestTaskServiceRunTaskPrompt_LaunchesTheProvidersArgvThroughThePromptWrappe
 	require.Equal(t, "task-1", svc.sessionClient.startedTask.ID)
 }
 
-func TestTaskServiceRunTaskPrompt_TypesNothingIntoTheProvider(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_TypesNothingIntoTheProviderItLaunches(t *testing.T) {
 	svc, _ := promptRunFixture(t)
 	svc.providerRepo.promptRunSpec = TaskSessionLaunchSpec{
 		Command:      []string{"codex"},
@@ -518,6 +899,7 @@ func TestTaskServiceRunTaskPrompt_TypesNothingIntoTheProvider(t *testing.T) {
 	require.NotContains(t, svc.events, "prefill_task_session")
 	require.Empty(t, svc.sessionClient.prefilledLaunch.PrefillInput)
 	require.Empty(t, svc.sessionClient.submittedInputs)
+	require.Empty(t, svc.sessionClient.submittedPrompts)
 }
 
 func TestTaskServiceRunTaskPrompt_LeavesTheTaskRecordAndLaunchDefaultsAlone(t *testing.T) {
@@ -600,19 +982,9 @@ func TestTaskServiceRunTaskPrompt_RejectsInputThatCannotRun(t *testing.T) {
 			_, err := svc.service.RunTaskPrompt(t.Context(), tt.input)
 
 			require.ErrorContains(t, err, tt.want)
-			require.Nil(t, svc.sessionClient.startedTask)
+			requireNothingDone(t, svc)
 		})
 	}
-}
-
-func TestTaskServiceRunTaskPrompt_FailsWhenThePromptCannotBeWritten(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	svc.promptFiles.err = errors.New("disk full")
-
-	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{TaskID: "task-1", Prompt: "triage"})
-
-	require.ErrorContains(t, err, "disk full")
-	require.Nil(t, svc.sessionClient.startedTask)
 }
 
 func TestPromptRunCommand_WrapsTheArgvSoThePromptIsItsLastArgument(t *testing.T) {
@@ -661,9 +1033,9 @@ func TestShortSessionID(t *testing.T) {
 	require.Equal(t, "ab", shortSessionID("ab"))
 }
 
-func TestTaskServiceRunTaskPrompt_ClosesNothingForAPromptThatIsTooLong(t *testing.T) {
+func TestTaskServiceRunTaskPrompt_EndsNothingForAPromptThatIsTooLong(t *testing.T) {
 	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
+	idleProvider(svc)
 
 	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{
 		TaskID: "task-1",
@@ -671,8 +1043,7 @@ func TestTaskServiceRunTaskPrompt_ClosesNothingForAPromptThatIsTooLong(t *testin
 	})
 
 	require.ErrorContains(t, err, "prompt is too long")
-	require.Empty(t, svc.sessionClient.closedTasks, "the idle session is left as it was")
-	require.Empty(t, svc.promptFiles.writes)
+	requireNothingDone(t, svc)
 }
 
 func TestTaskServiceRunTaskPrompt_TakesAPromptOfTheLargestSize(t *testing.T) {
@@ -680,92 +1051,19 @@ func TestTaskServiceRunTaskPrompt_TakesAPromptOfTheLargestSize(t *testing.T) {
 
 	result := runPrompt(t, svc, RunTaskPromptInput{Prompt: strings.Repeat("x", maxPromptRunPromptBytes)})
 
-	requireLaunched(t, svc, result, "started fresh")
+	requireStarted(t, svc, result, "started fresh")
 }
 
-func TestTaskServiceRunTaskPrompt_SkipsAPaneWhoseShellStartedSomething(t *testing.T) {
-	// A shell waiting at its prompt has no child process; whatever it started
-	// is running, shell or not, and would read what rig types.
-	tests := []struct {
-		name     string
-		commands []string
-		children []string
-		detail   string
-	}{
-		{"a script run by sh", []string{"sh", "sh"}, []string{"sh"}, "skipped: pane is running sh"},
-		{"a script run by bash", []string{"bash", "bash"}, []string{"bash"}, "skipped: pane is running bash"},
-		{"a job in the background", []string{"zsh", "sh"}, []string{"sh"}, "skipped: pane is running sh"},
-		{"a nested shell", []string{"zsh", "-bash"}, []string{"-bash"}, "skipped: pane is running bash"},
-		{"another run's wrapper still starting", []string{"zsh", "sh"}, []string{"sh"}, "skipped: pane is running sh"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			svc, _ := promptRunFixture(t)
-			svc.sessionClient.inspectState = TaskSessionRuntimeState{
-				Exists:         true,
-				ActiveCommands: tt.commands,
-				ChildCommands:  tt.children,
-			}
+func TestTaskServiceRunTaskPrompt_SendsALargePromptToARunningSessionToo(t *testing.T) {
+	svc, _ := promptRunFixture(t)
+	idleProvider(svc)
+	providerTakesPrompts(svc)
 
-			result := runPrompt(t, svc, RunTaskPromptInput{})
+	_, err := svc.service.RunTaskPrompt(t.Context(), RunTaskPromptInput{
+		TaskID: "task-1", Prompt: strings.Repeat("x", maxPromptRunPromptBytes+1), SessionMode: PromptRunSessionSame,
+	})
 
-			requireSkipped(t, svc, result, tt.detail)
-		})
-	}
-}
-
-func TestTaskServiceRunTaskPrompt_ChecksTheTaskAgainOnceItHoldsTheLock(t *testing.T) {
-	tests := []struct {
-		name   string
-		change func(svc *testTaskServiceHarness, task *Task)
-		skip   string
-		launch func(t *testing.T, svc *testTaskServiceHarness)
-	}{
-		{
-			name:   "shelved",
-			change: func(_ *testTaskServiceHarness, task *Task) { task.ShelvedAt = time.Now() },
-			skip:   "skipped: task is shelved",
-		},
-		{
-			name:   "deleted",
-			change: func(svc *testTaskServiceHarness, _ *Task) { svc.taskRepo.listTasks = nil },
-			skip:   "skipped: task not found",
-		},
-		{
-			name:   "no longer ready",
-			change: func(_ *testTaskServiceHarness, task *Task) { task.CreationStatus = TaskCreationStatusFailed },
-			skip:   "skipped: task is not ready (failed)",
-		},
-		{
-			name:   "renamed",
-			change: func(_ *testTaskServiceHarness, task *Task) { task.TmuxSession = "renamed_session" },
-			launch: func(t *testing.T, svc *testTaskServiceHarness) {
-				require.Equal(t, "renamed_session", svc.sessionClient.startedTask.TmuxSession,
-					"the session the lock found, not the one read before it")
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			svc, task := promptRunFixture(t)
-			// The first read of the task is the look before the lock; the
-			// second is the run's own, with the lock held.
-			svc.taskRepo.onListTasks = func(call int) {
-				if call == 2 {
-					tt.change(svc, task)
-				}
-			}
-
-			result := runPrompt(t, svc, RunTaskPromptInput{})
-
-			if tt.skip != "" {
-				requireSkipped(t, svc, result, tt.skip)
-				return
-			}
-			requireLaunched(t, svc, result, "started fresh")
-			tt.launch(t, svc)
-		})
-	}
+	require.ErrorContains(t, err, "prompt is too long", "one cap whichever way the run goes")
 }
 
 func setPromptRunStatus(svc *testTaskServiceHarness, status TaskStatusUpdate) {
@@ -815,7 +1113,7 @@ func TestTaskServiceRunTaskPrompt_HoldsTheTaskUntilTheProviderHasTakenThePrompt(
 	require.False(t, isDone())
 
 	// The provider starts its session but has not taken the prompt yet: a
-	// session that has just started reads as idle, and would be closed.
+	// session that has just started reads as idle, and would be ended.
 	setPromptRunStatus(svc, TaskStatusUpdate{Phase: TaskStatusPhaseStarting, RawEventName: HookEventSessionStart})
 	require.Never(t, isDone, 50*time.Millisecond, 5*time.Millisecond)
 	setPromptRunStatus(
@@ -832,7 +1130,7 @@ func TestTaskServiceRunTaskPrompt_HoldsTheTaskUntilTheProviderHasTakenThePrompt(
 	require.Eventually(t, isDone, 5*time.Second, time.Millisecond)
 	done := <-finished
 	require.NoError(t, done.err)
-	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunLaunched, Detail: "started fresh"}, done.result)
+	require.Equal(t, promptRunStarted("started fresh"), done.result)
 	require.NoError(t, svc.service.operations.Run(
 		t.Context(), "task-1", taskOperationRename, false, func(context.Context) error { return nil },
 	))
@@ -845,33 +1143,10 @@ func TestTaskServiceRunTaskPrompt_LetsGoOfTheTaskWhenTheProviderStaysSilent(t *t
 
 	result := runPrompt(t, svc, RunTaskPromptInput{})
 
-	requireLaunched(t, svc, result, "started fresh")
+	requireStarted(t, svc, result, "started fresh")
 	require.NoError(t, svc.service.operations.Run(
 		t.Context(), "task-1", taskOperationRename, false, func(context.Context) error { return nil },
 	), "a provider held up by a startup dialog does not hold the task for good")
-}
-
-func TestTaskServiceRunTaskPrompt_ReadsTheStatusAfresh(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
-	// Something just looked at the status, so the observer holds a view of it.
-	status, err := svc.service.LatestTaskStatus(t.Context(), "task-1")
-	require.NoError(t, err)
-	require.Equal(t, HookEventStop, status.RawEventName)
-	// Then the provider asks for a permission.
-	svc.taskRepo.mu.Lock()
-	svc.taskRepo.latestByTask["task-1"] = TaskStatusUpdate{
-		TaskID:       "task-1",
-		Provider:     ProviderCodex,
-		Phase:        TaskStatusPhaseWaitingForInput,
-		RawEventName: HookEventPermissionRequest,
-		ObservedAt:   time.Now().UTC().Add(time.Second),
-	}
-	svc.taskRepo.mu.Unlock()
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireSkipped(t, svc, result, "skipped: waiting on a permission prompt")
 }
 
 func TestTaskServiceRunTaskPrompt_WithdrawsAPromptAnEarlierLaunchLeftWaiting(t *testing.T) {
@@ -887,9 +1162,9 @@ func TestTaskServiceRunTaskPrompt_WithdrawsAPromptAnEarlierLaunchLeftWaiting(t *
 	svc.sessionClient.startedTask = nil
 
 	// A run then replaces that session with one of its own.
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWaitingForInput, RawEventName: HookEventStop})
+	idleProvider(svc)
 	result := runPrompt(t, svc, RunTaskPromptInput{})
-	requireLaunched(t, svc, result, "started fresh")
+	requireStarted(t, svc, result, "started fresh")
 
 	// The run's provider reports its session. It is not the launch's: the
 	// task's prompt is not typed into it.
@@ -914,7 +1189,8 @@ func TestTaskServiceRunTaskPrompt_LeavesAPromptWaitingWhenTheRunIsSkipped(t *tes
 	require.NoError(t, err)
 
 	// A run that does nothing leaves the user's launch to type its prompt.
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
+	runningProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
+	svc.sessionClient.paneShows = []paneShow{{shows: true}}
 	result := runPrompt(t, svc, RunTaskPromptInput{})
 	require.Equal(t, PromptRunSkipped, result.Outcome)
 	svc.taskRepo.mu.Lock()
@@ -928,59 +1204,6 @@ func TestTaskServiceRunTaskPrompt_LeavesAPromptWaitingWhenTheRunIsSkipped(t *tes
 		defer svc.sessionClient.mu.Unlock()
 		return svc.sessionClient.prefillCalls == 1
 	}, 5*time.Second, time.Millisecond)
-}
-
-func TestTaskServiceRunTaskPrompt_AsksTheProviderAboutTheTranscriptRigRecorded(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
-	svc.providerRepo.interrupted = true
-	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
-		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-2",
-	}
-	svc.taskRepo.providerSessionsByTask["task-1"] = []TaskProviderSession{
-		{
-			TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "sess-1",
-			TranscriptPath: "/home/me/.codex/sessions/sess-1.jsonl", LastObservedAt: time.Unix(100, 0),
-		},
-		{
-			TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "sess-2",
-			TranscriptPath: "/home/me/.codex/sessions/old.jsonl", LastObservedAt: time.Unix(200, 0),
-		},
-		{
-			TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "sess-2",
-			TranscriptPath: "/home/me/.codex/sessions/sess-2.jsonl", LastObservedAt: time.Unix(300, 0),
-		},
-		{
-			TaskID: "task-1", Provider: ProviderClaude, ProviderSessionID: "sess-2",
-			TranscriptPath: "/home/me/.claude/projects/p/sess-2.jsonl", LastObservedAt: time.Unix(50, 0),
-		},
-	}
-
-	result := runPrompt(t, svc, RunTaskPromptInput{})
-
-	requireLaunched(t, svc, result, "started fresh")
-	require.Len(t, svc.providerRepo.interruptedSessions, 1)
-	require.Equal(t, TaskProviderSession{
-		TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "sess-2",
-		TranscriptPath: "/home/me/.codex/sessions/sess-2.jsonl", LastObservedAt: time.Unix(300, 0),
-	}, svc.providerRepo.interruptedSessions[0], "the latest record of the session the status belongs to")
-}
-
-func TestTaskServiceRunTaskPrompt_AsksAboutASessionByItsIDWhenNoTranscriptWasRecorded(t *testing.T) {
-	svc, _ := promptRunFixture(t)
-	setWindowedProvider(svc, TaskStatusUpdate{Phase: TaskStatusPhaseWorking})
-	svc.taskRepo.latestResumeByTask["task-1"] = TaskResumeMetadata{
-		TaskID: "task-1", Provider: ProviderCodex, SessionID: "sess-1",
-	}
-	svc.taskRepo.providerSessionsByTask["task-1"] = []TaskProviderSession{
-		{TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "sess-1"},
-	}
-
-	runPrompt(t, svc, RunTaskPromptInput{})
-
-	require.Equal(t, []TaskProviderSession{
-		{TaskID: "task-1", Provider: ProviderCodex, ProviderSessionID: "sess-1"},
-	}, svc.providerRepo.interruptedSessions)
 }
 
 func TestPromptRunCommand_DeliversThePromptToTheProviderByteForByte(t *testing.T) {

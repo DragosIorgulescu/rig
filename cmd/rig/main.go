@@ -121,9 +121,6 @@ func newProductionCommandRuntime(stdout io.Writer, stderr io.Writer) commandRunt
 			renderDaemonStatus(stdout, status)
 			return nil
 		},
-		runScheduleTry: func(request scheduleTryRequest) error {
-			return runScheduleTry(stdout, request)
-		},
 	}
 }
 
@@ -139,7 +136,6 @@ type commandRuntime struct {
 	runDaemonStop    func() error
 	runDaemonRestart func() error
 	runDaemonStatus  func() error
-	runScheduleTry   func(request scheduleTryRequest) error
 }
 
 func newRootCommand(runtime commandRuntime) *cobra.Command {
@@ -167,7 +163,6 @@ func newRootCommand(runtime commandRuntime) *cobra.Command {
 	root.AddCommand(newSetupCommand(runtime))
 	root.AddCommand(newDoctorCommand(runtime))
 	root.AddCommand(newDaemonCommand(runtime))
-	root.AddCommand(newScheduleCommand(runtime))
 
 	return root
 }

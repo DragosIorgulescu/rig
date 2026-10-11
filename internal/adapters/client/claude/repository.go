@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -423,6 +424,16 @@ func (r *repository) TaskSessionCommandName() string {
 		return "claude"
 	}
 	return commandName
+}
+
+// busyMarkers are the texts Claude Code's screen shows only while a turn runs,
+// on the line with the spinner: "✻ Pondering… (12s · esc to interrupt)". This
+// is the one place they are kept.
+var busyMarkers = []string{"esc to interrupt"}
+
+// BusyMarkers returns the texts that mean a turn is running.
+func (r *repository) BusyMarkers() []string {
+	return slices.Clone(busyMarkers)
 }
 
 // RecoverLatestTaskStatus returns no recovery: Claude status is driven by

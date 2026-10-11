@@ -44,21 +44,28 @@ Use `rig` for the CLI command and Rig for the product or system.
   another purpose. It happens in Rig, or by renaming the Task's provider
   session, whose new title the Task takes. A rename drops the Task's original
   ask, so new sessions are not briefed on what it was first for.
-- Prompt run: Starting a Task's Provider on a stored prompt, in a fresh
-  Provider session or the Task's latest one, without the user opening the
-  Task. The prompt is kept in a file under Rig's data dir and is the last
-  argument of the Provider's launch command, so nothing is typed into the
-  Provider. A run is started with `rig schedule try` for now. It is skipped,
-  never forced, while the Task is busy: another Task operation is running, the
-  user is viewing its window, its Provider is working or waiting on a
-  permission prompt, or something other than a shell is in its window. An idle
-  Provider session in the window is closed first. A run does not change the
-  Task record, and does not wait for the Provider to finish.
+- Prompt run: Giving a Task's Provider a stored prompt without the user opening
+  the Task. In the same session, a Provider that is running in the Task's
+  window is sent the prompt as a paste followed by Enter; with none running, it
+  is started with the prompt as the last argument of its launch command,
+  resuming the Task's latest Provider session when it has one. In a new
+  session, whatever Provider session is in the window is ended and a fresh one
+  is started with the prompt. A Prompt run is skipped, never forced, only while
+  the Task's session is Busy: working on a turn, or blocked on a permission
+  prompt. Whether the user is looking at the window does not matter. A run
+  does not change the Task record, and does not wait for the Provider to
+  finish.
+- Busy: What a Provider session is while it works on a turn or waits on a
+  permission prompt. Rig reads it from the window, where the Provider shows a
+  marker such as "esc to interrupt" only while a turn runs, and not from the
+  Provider's last hook status alone, which can stay at working after the user
+  interrupts a turn.
 - Permission mode: How freely the Provider of a Prompt run may act before it
   asks the user: `auto` (the default), `default`, `accept_edits` or `bypass`.
   Each Provider maps the mode to its own launch flags, and refuses one it
-  cannot honour, such as `accept_edits` for Codex. It is chosen per run and
-  not kept on the Task.
+  cannot honour, such as `accept_edits` for Codex. It applies when the Provider
+  is started for a run, not to a session that is already running, and is not
+  kept on the Task.
 - Handoff note: A note the previous provider session writes, without a
   terminal on a fork that is not saved, for a new session to start from: goal,
   state, decisions, where things are, gotchas, next step. Kept under Rig's
@@ -209,6 +216,10 @@ Use `rig` for the CLI command and Rig for the product or system.
   running, a Prompt run still starting included, is skipped. It launches the
   Task's Active provider with the Task's launch options and Provider
   configuration, and never changes any of them.
+- A Prompt run is skipped only when the Task's session is Busy. A run that
+  cannot start the prompt for a reason the user can act on, such as a launch
+  that fails or a session that does not take the prompt, fails; that is a
+  result of the run, not a skip.
 - A Prompt run in the same session resumes the Task's latest Provider session
   only when it belongs to the Task's Active provider; otherwise it starts a
   fresh one.
@@ -243,7 +254,7 @@ Use `rig` for the CLI command and Rig for the product or system.
 - Prefer "provider" for Codex or other future AI runtimes.
 - Keep durable task fields separate from live runtime observations in design
   discussions.
-- Use "prompt run" only for starting a Task's Provider on a stored prompt; the
+- Use "prompt run" only for giving a Task's Provider a stored prompt; the
   work it does is still the Task's.
 - Use "daemon" for the background process and "TUI" for the foreground
   terminal interface.

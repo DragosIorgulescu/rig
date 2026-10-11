@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -323,12 +324,6 @@ func (r *repository) BuildPromptRunLaunchSpec(
 	return core.TaskSessionLaunchSpec{Command: command, ReadyMarker: readyMarker}, nil
 }
 
-// LastTurnInterrupted is always false: rig reads no interruption marker from
-// Codex sessions, so a Codex status that says working is trusted.
-func (r *repository) LastTurnInterrupted(context.Context, *core.Task, core.TaskProviderSession) (bool, error) {
-	return false, nil
-}
-
 func (r *repository) BuildReconnectTaskSessionLaunchSpec(
 	task *core.Task,
 	sessionID string,
@@ -366,6 +361,16 @@ func (r *repository) TaskSessionCommandName() string {
 		return "codex"
 	}
 	return commandName
+}
+
+// busyMarkers are the texts Codex's screen shows only while a turn runs, on
+// its status line: "Working (3s • Esc to interrupt)". They are matched without
+// regard to case. This is the one place they are kept.
+var busyMarkers = []string{"esc to interrupt"}
+
+// BusyMarkers returns the texts that mean a turn is running.
+func (r *repository) BusyMarkers() []string {
+	return slices.Clone(busyMarkers)
 }
 
 func (r *repository) codexTaskCommand(env core.ProviderEnv, args ...string) ([]string, error) {

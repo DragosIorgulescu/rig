@@ -46,6 +46,8 @@ type service struct {
 	// paces the wait.
 	sessionExitWait time.Duration
 	sessionExitPoll time.Duration
+	// promptRunTiming paces prompt runs; the zero value keeps the defaults.
+	promptRunTiming promptRunTiming
 }
 
 // The concrete service must satisfy every port it is wired into. These

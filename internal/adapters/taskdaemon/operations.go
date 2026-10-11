@@ -52,13 +52,6 @@ type launchSettingsRequest struct {
 	Env core.ProviderEnv `json:"env,omitempty"`
 }
 
-type runTaskPromptRequest struct {
-	TaskID         string                    `json:"task_id"`
-	Prompt         string                    `json:"prompt"`
-	SessionMode    core.PromptRunSessionMode `json:"session_mode,omitempty"`
-	PermissionMode core.TaskPermissionMode   `json:"permission_mode,omitempty"`
-}
-
 type importSessionRequest struct {
 	Env     core.ProviderEnv            `json:"env,omitempty"`
 	Session core.ProviderSessionSummary `json:"session"`
@@ -284,23 +277,6 @@ var opGetLaunchSettings = unaryOp[launchSettingsRequest, *core.LaunchSettings]{
 	},
 }
 
-var opRunTaskPrompt = unaryOp[runTaskPromptRequest, core.RunTaskPromptResult]{
-	command:  "run_task_prompt",
-	envelope: "task_prompt_run",
-	call: func(ctx context.Context, svc core.TaskService, req runTaskPromptRequest) (core.RunTaskPromptResult, error) {
-		taskID, err := requiredTaskID("run_task_prompt", req.TaskID)
-		if err != nil {
-			return core.RunTaskPromptResult{}, err
-		}
-		return svc.RunTaskPrompt(ctx, core.RunTaskPromptInput{
-			TaskID:         taskID,
-			Prompt:         req.Prompt,
-			SessionMode:    req.SessionMode,
-			PermissionMode: req.PermissionMode,
-		})
-	},
-}
-
 var opDeleteTask = unaryOp[taskIDRequest, emptyResponse]{
 	command:  "delete_task",
 	envelope: "task_deleted",
@@ -377,7 +353,6 @@ var socketUnaryHandlers = map[string]unaryHandler{
 	opDetectProviders.command:        serveUnary(opDetectProviders),
 	opSwitchTaskProvider.command:     serveUnary(opSwitchTaskProvider),
 	opGetLaunchSettings.command:      serveUnary(opGetLaunchSettings),
-	opRunTaskPrompt.command:          serveUnary(opRunTaskPrompt),
 	opDeleteTask.command:             serveUnary(opDeleteTask),
 	opListTasks.command:              serveUnary(opListTasks),
 	opLatestTaskStatus.command:       serveUnary(opLatestTaskStatus),
