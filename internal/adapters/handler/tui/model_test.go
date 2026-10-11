@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -75,7 +76,7 @@ func TestModel_ViewRendersTaskMetadata(t *testing.T) {
 	require.Contains(
 		t,
 		view,
-		"n new  N session  d shelve  e rename  tab shelf  i import  p provider  r refresh  space details  x clean  q quit",
+		"n new  N session  d shelve  e rename  tab shelf  s scheduled  i import  p provider  r refresh  space details  x clean  q quit",
 	)
 	require.Contains(t, view, "first task")
 	require.Contains(t, view, "repo-a")
@@ -2110,7 +2111,7 @@ func TestModel_PRPickerEnterCreatesTaskFromSelectedPR(t *testing.T) {
 	require.Contains(
 		t,
 		view,
-		"n new  N session  d shelve  e rename  tab shelf  i import  p provider  r refresh  space details  x clean  q quit",
+		"n new  N session  d shelve  e rename  tab shelf  s scheduled  i import  p provider  r refresh  space details  x clean  q quit",
 	)
 	require.Contains(t, view, "Creating task from pull request")
 	require.NotContains(t, view, "Suggesting name")
@@ -2186,7 +2187,7 @@ func TestModel_PRPickerCreateFailureReturnsToBrowseWithProgressAndError(t *testi
 	require.Contains(
 		t,
 		view,
-		"n new  N session  d shelve  e rename  tab shelf  i import  p provider  r refresh  space details  x clean  q quit",
+		"n new  N session  d shelve  e rename  tab shelf  s scheduled  i import  p provider  r refresh  space details  x clean  q quit",
 	)
 	require.Contains(t, view, "Creating task from pull request")
 	require.NotContains(t, view, "Creating worktree")
@@ -2447,6 +2448,19 @@ type frontendHarness struct {
 	newSessionStreamCalls       int
 	claimedFolder               string
 	claimedTasks                []*core.Task
+	// schedules are the schedules of the listed Scheduled tasks. Editing,
+	// pausing and resuming change them, as the daemon would.
+	schedules              []core.ScheduledTask
+	listSchedulesErr       error
+	listSchedulesCalls     int
+	updateScheduleErr      error
+	updateScheduleTaskIDs  []string
+	updateScheduleInputs   []core.ScheduleInput
+	updateScheduleVersions []time.Time
+	setEnabledErr          error
+	setEnabledCalls        []string
+	runNowErr              error
+	runNowTaskIDs          []string
 }
 
 func newFrontendHarness() *frontendHarness {
@@ -2732,6 +2746,66 @@ func newFrontendHarness() *frontendHarness {
 				return ch, nil
 			}
 			return frontend.subscribeTaskStatus[taskID], nil
+		},
+	).Maybe()
+	frontend.mock.EXPECT().ListTaskSchedules(mock.Anything).RunAndReturn(
+		func(context.Context) ([]core.ScheduledTask, error) {
+			frontend.listSchedulesCalls++
+			if frontend.listSchedulesErr != nil {
+				return nil, frontend.listSchedulesErr
+			}
+			return append([]core.ScheduledTask(nil), frontend.schedules...), nil
+		},
+	).Maybe()
+	// An edit that names a version that is no longer the schedule's is a
+	// conflict, as the daemon would decide.
+	frontend.mock.EXPECT().UpdateTaskSchedule(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, taskID string, input core.ScheduleInput, expected time.Time) (*core.ScheduledTask, error) {
+			frontend.updateScheduleTaskIDs = append(frontend.updateScheduleTaskIDs, taskID)
+			frontend.updateScheduleInputs = append(frontend.updateScheduleInputs, input)
+			frontend.updateScheduleVersions = append(frontend.updateScheduleVersions, expected)
+			if frontend.updateScheduleErr != nil {
+				return nil, frontend.updateScheduleErr
+			}
+			for index := range frontend.schedules {
+				schedule := &frontend.schedules[index]
+				if schedule.TaskID != taskID {
+					continue
+				}
+				if !schedule.UpdatedAt.Equal(expected) {
+					return nil, core.ErrScheduleConflict
+				}
+				schedule.ScheduleInput = input
+				schedule.UpdatedAt = schedule.UpdatedAt.Add(time.Minute)
+				updated := *schedule
+				return &updated, nil
+			}
+			return nil, core.ErrScheduleNotFound
+		},
+	).
+		Maybe()
+	frontend.mock.EXPECT().SetTaskScheduleEnabled(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, taskID string, enabled bool) (*core.ScheduledTask, error) {
+			frontend.setEnabledCalls = append(frontend.setEnabledCalls, fmt.Sprintf("%s:%t", taskID, enabled))
+			if frontend.setEnabledErr != nil {
+				return nil, frontend.setEnabledErr
+			}
+			for index := range frontend.schedules {
+				schedule := &frontend.schedules[index]
+				if schedule.TaskID == taskID {
+					schedule.Enabled = enabled
+					schedule.UpdatedAt = schedule.UpdatedAt.Add(time.Minute)
+					updated := *schedule
+					return &updated, nil
+				}
+			}
+			return nil, core.ErrScheduleNotFound
+		},
+	).Maybe()
+	frontend.mock.EXPECT().RunTaskScheduleNow(mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, taskID string) error {
+			frontend.runNowTaskIDs = append(frontend.runNowTaskIDs, taskID)
+			return frontend.runNowErr
 		},
 	).Maybe()
 	return frontend

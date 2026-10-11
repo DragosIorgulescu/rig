@@ -34,6 +34,7 @@ func newRenameInput(name string, width int) textinput.Model {
 	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(colorAccent)
 	styles.Blurred = styles.Focused
 	styles.Cursor.Color = colorAccent
+	styles.Cursor.BlinkSpeed = cursorBlinkSpeed
 	input.SetStyles(styles)
 
 	if width > 0 {

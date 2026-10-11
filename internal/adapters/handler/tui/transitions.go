@@ -43,7 +43,10 @@ func backTarget(mode modelMode, hasSetup bool, setupOnly bool) backDest {
 	case modePRPicker:
 		// Back to the prompt: both modes edit the same task draft.
 		return backDest{to: modePromptInput}
-	case modeCleanupConfirm, modeSwitchProvider, modeImportSession, modeRenameTask:
+	case modeScheduleStep:
+		// Back to the composer: the schedule step continues the same task draft.
+		return backDest{to: modePromptInput}
+	case modeCleanupConfirm, modeSwitchProvider, modeImportSession, modeRenameTask, modeScheduleEdit:
 		return backDest{to: modeBrowse}
 	case modeProviderSetup:
 		// Provider setup is mandatory: without a valid setup the only way out
@@ -68,11 +71,12 @@ const (
 	familySwitch
 	familyImport
 	familyRename
+	familyScheduleEdit
 )
 
 func familyOf(mode modelMode) modeFamily {
 	switch mode {
-	case modePromptInput, modePRPicker:
+	case modePromptInput, modePRPicker, modeScheduleStep:
 		return familyDraft
 	case modeProviderSetup:
 		return familySetup
@@ -82,6 +86,8 @@ func familyOf(mode modelMode) modeFamily {
 		return familyImport
 	case modeRenameTask:
 		return familyRename
+	case modeScheduleEdit:
+		return familyScheduleEdit
 	default: // browse and cleanup confirm own no mode state
 		return familyBrowse
 	}
@@ -105,6 +111,7 @@ func (m *model) clearFamilyState(family modeFamily) {
 	switch family {
 	case familyDraft:
 		m.draft = taskDraft{}
+		m.scheduleForm = scheduleFormState{}
 	case familySetup:
 		m.setupForm = setupFormState{}
 	case familySwitch:
@@ -113,6 +120,8 @@ func (m *model) clearFamilyState(family modeFamily) {
 		m.sessionImport = importState{}
 	case familyRename:
 		m.rename = renameState{}
+	case familyScheduleEdit:
+		m.scheduleForm = scheduleFormState{}
 	}
 }
 
@@ -138,6 +147,10 @@ func (m model) handleBack() (tea.Model, tea.Cmd) {
 	case modePRPicker:
 		// Same family: the draft survives, minus the picker's validation error.
 		m.draft.err = nil
+		return m, m.draft.input.Focus()
+	case modeScheduleStep:
+		// Same family: the draft and the schedule typed so far survive.
+		m.scheduleForm.cron.Blur()
 		return m, m.draft.input.Focus()
 	default:
 		return m, nil

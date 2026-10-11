@@ -22,6 +22,9 @@ a background daemon handles longer running orchestration.
   when its context has grown, from a handoff note the previous session
   writes, instead of compacting. The task stays one row however many
   sessions it takes.
+- **Scheduled tasks**: give a provider a stored prompt on a cron schedule, from
+  the dashboard. They have a list of their own, with when each runs next, how
+  its last run went and why a run failed.
 - **Multi-provider support**: enable Codex and Claude Code through `rig setup`,
   pick a default provider, cycle providers with `tab` while creating a task, and
   switch an existing task to another configured provider.
@@ -315,7 +318,7 @@ the one with the best-placed task first. The shelf and the list of every folder
 are ordered the same way.
 
 The order is set when rig opens, when you refresh with `r`, and when you switch
-to the shelf (`tab`) or to every folder (`f`). The list appears at once,
+to the shelf (`tab`), the scheduled list (`s`) or every folder (`f`). The list appears at once,
 ordered by what rig knows then, and can move once more, within a second, as the
 first live statuses come in. After that, rows hold still while their status and
 activity update, so the list never shuffles under your cursor. A task you
@@ -356,6 +359,7 @@ Common TUI keys:
 | `d` | Shelve the selected task, or put it back from the shelf |
 | `e` | Rename the selected task |
 | `tab` | Switch the list between the current tasks and the shelf |
+| `s` | Switch the list to the scheduled tasks (see [Scheduled tasks](#scheduled-tasks)) |
 | `i` | Import a provider session started in this folder outside Rig |
 | `p` | Switch the selected task to another configured provider |
 | `r` | Refresh task data and reorder the list |
@@ -485,6 +489,72 @@ resuming its latest session, as a reconnect would; `d` puts it back without
 starting anything, so the session resumes when you next open it. Starting,
 importing or switching work happens on the current list, and `esc` returns to
 it.
+
+## Scheduled tasks
+
+A scheduled task gives its provider a stored prompt on a schedule, with nobody
+at the keyboard: a morning digest of yesterday's pull requests, a weekly
+report, a check of the build every few hours. It is a task of its own kind. The
+current list leaves it out; `s` switches the list to the scheduled tasks, and
+`s` or `esc` returns. The scheduled list scopes to the folder `rig` was
+launched in, and `f` shows every folder, as the current list does.
+
+Create one on the scheduled list with `n`. The prompt, provider, model, effort
+and workspace are chosen as for any task, and `enter` leads to a schedule step:
+
+- a cron expression of five fields (minute, hour, day, month, weekday), or a
+  descriptor such as `@hourly`, `@daily`, `@weekly` or `@every 2h`, in local
+  time. Runs must be at least five minutes apart
+  (`RIG_SCHEDULER_MIN_INTERVAL`). A schedule the daemon refuses is reported on
+  the step, with what you typed still there;
+- the session mode, switched with `ctrl+t`. In `new` (the default) each run ends
+  whatever session is in the task's window and starts a fresh one with the
+  prompt. In `same` one session stays open and each run sends it the prompt;
+  when none is running (the first run, after a reboot or a crash) the provider
+  is started with the prompt, resuming its last conversation if it has one;
+- the permission mode, cycled with `ctrl+p`: `auto` (the default), `default`,
+  `accept_edits` or `bypass`. It applies when the provider is started for a
+  run. Codex does not offer `accept_edits`.
+
+A scheduled task's tmux session has one window and no `editor` window, is kept
+until you delete the task, and starts no provider until the first run. It
+cannot be shelved or given sessions of its own (`N`), and the scheduled list
+does not offer importing or switching its provider.
+
+Each row shows the provider, the schedule, when it runs next (in hours and
+minutes when under a day away, by the clock after that), and how the last run
+went: `ran 09:00`, `running since 09:00`, `skipped 09:00: session busy`,
+`failed 09:00: <why>`, or `paused`. `space` shows the details: the prompt in
+full, the schedule with its next run as a date and time, the session and
+permission modes, and the last run with its reason in full. The rows refresh
+every few seconds while the list is shown.
+
+Keys on the scheduled list:
+
+| Key | Action |
+|-----|--------|
+| `n` | Create a scheduled task |
+| `e` | Edit the prompt, schedule, session mode and permission mode |
+| `r` | Run now, whether or not the schedule is paused; the next scheduled run is unchanged |
+| `z` | Pause the schedule, or resume it |
+| `enter` | Attach to the task's tmux session |
+| `d` | Delete the task and its schedule (`x` too), after a confirmation |
+| `space` | Show or hide the details |
+| `s`, `esc` | Back to the current list |
+
+In the editor, `tab` moves between the prompt and the schedule, `alt+enter`
+adds a line to the prompt, and `enter` saves. If the schedule was changed
+elsewhere since you opened the editor, nothing is saved: the editor shows the
+schedule as it is now, and you make your edit again.
+
+A run is skipped only while the task's session is busy: working on a turn, or
+waiting on a permission prompt. That is read from the window, where the
+provider shows `esc to interrupt` only during a turn, so a stale status does not
+skip a run. Whether you are looking at the window does not matter. A run that
+started stays `running` until the provider says its turn is over (`ran`), or
+fails with the provider's error or because the session ended. A run missed
+because the daemon was down is made once when it starts again; the runs between
+are not made up.
 
 ## Renaming
 

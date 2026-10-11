@@ -42,6 +42,9 @@ func (m model) listView() string {
 	if m.err != nil {
 		lines = append(lines, errorStyle.Render("Error: "+m.err.Error()), "")
 	}
+	if m.notice != "" {
+		lines = append(lines, healthyStyle.Render(truncateStr(m.notice, totalWidth)), "")
+	}
 	lines = append(lines, m.scopeLine(totalWidth)...)
 
 	switch {
@@ -50,6 +53,10 @@ func (m model) listView() string {
 		lines = append(lines, sectionLines(m.listCreateStatusView(), totalWidth)...)
 	case len(m.rows) == 0 && m.showShelf:
 		lines = append(lines, dimStyle.Render("The shelf is empty. Press d on a task to shelve it."))
+		lines = append(lines, sectionLines(m.listCreateStatusView(), totalWidth)...)
+	case len(m.rows) == 0 && m.showScheduled:
+		lines = append(lines, dimStyle.Render("No scheduled tasks."))
+		lines = append(lines, dimStyle.Render("Press n to schedule one."))
 		lines = append(lines, sectionLines(m.listCreateStatusView(), totalWidth)...)
 	case len(m.rows) == 0:
 		lines = append(lines, dimStyle.Render("No tasks found."))
@@ -119,6 +126,9 @@ func (m model) taskListRowBudget(totalWidth int, totalHeight int) int {
 
 	baseLineCount := 2 + len(m.scopeLine(totalWidth))
 	if m.err != nil {
+		baseLineCount += 2
+	}
+	if m.notice != "" {
 		baseLineCount += 2
 	}
 
@@ -327,6 +337,10 @@ func (m model) renderRow(index int, row taskRow, totalWidth int) (string, string
 			time.Since(row.task.ShelvedAt),
 		)+" ago", dimStyle
 	}
+	if row.task.IsScheduled() && statusText == iconStatusIdle+" no status" {
+		// Its session is an idle shell until the first run.
+		statusText = iconStatusIdle + " idle"
+	}
 	statusCell := padRightVisible(statusText, colWidthStatus)
 	timeCell := padLeftVisible(taskElapsed(row.task), colWidthElapsed)
 
@@ -356,6 +370,10 @@ func (m model) renderRow(index int, row taskRow, totalWidth int) (string, string
 	if worktreesText := taskWorktreesRowText(row.worktrees); worktreesText != "" {
 		prText += "  " + worktreesText
 	}
+	if row.task.IsScheduled() {
+		// The schedule takes the place of the pull request, tokens and worktrees.
+		prText = m.scheduleRowText(row.schedule, totalWidth-colWidthAgent-4)
+	}
 
 	if index == m.selected {
 		line1 := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(nameCell) +
@@ -377,6 +395,10 @@ func (m model) selectedTaskDetailView() string {
 	row := m.selectedRow()
 	if row == nil || row.task == nil {
 		return ""
+	}
+
+	if row.task.IsScheduled() {
+		return m.scheduledTaskDetailView(*row)
 	}
 
 	task := row.task
@@ -459,6 +481,18 @@ func (m model) selectedTaskDetailView() string {
 		builder.WriteString(line + "\n")
 	}
 
+	m.writeDetailExtras(&builder, *row, true)
+
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+// writeDetailExtras writes what the details panel shows under the columns of a
+// task: the worktrees it edits, its tokens, the prompt it started from unless
+// the panel shows another, and its latest activity.
+func (m model) writeDetailExtras(builder *strings.Builder, row taskRow, withInitialPrompt bool) {
+	task := row.task
+	totalWidth := m.totalWidth()
+
 	if worktreeLines := taskWorktreesDetailLines(row.worktrees, totalWidth-6); len(worktreeLines) > 0 {
 		builder.WriteString("\n")
 		for _, line := range worktreeLines {
@@ -473,7 +507,7 @@ func (m model) selectedTaskDetailView() string {
 		}
 	}
 
-	if strings.TrimSpace(task.Prompt) != "" {
+	if withInitialPrompt && strings.TrimSpace(task.Prompt) != "" {
 		builder.WriteString("\n")
 		builder.WriteString("   " + headerLabelStyle.Render("INITIAL PROMPT") + "\n")
 		for _, line := range wrapAndTruncate(task.Prompt, totalWidth-6, 3) {
@@ -527,8 +561,6 @@ func (m model) selectedTaskDetailView() string {
 			builder.WriteString(line + "\n")
 		}
 	}
-
-	return strings.TrimRight(builder.String(), "\n")
 }
 
 func taskActivityPreview(events []core.TaskActivityEvent) (string, []string) {
@@ -575,6 +607,9 @@ func (m model) promptInputView() string {
 	newSession := m.draft.forTask != nil
 
 	title, intro := "new task", "Enter task prompt."
+	if m.draft.scheduled {
+		title, intro = "new scheduled task", "Enter the prompt every run gives the provider. The schedule comes next."
+	}
 	if newSession {
 		title = "new session · " + truncateStr(m.draft.forTask.DisplayName, 40)
 		intro = "A fresh session of this task. It starts with the continuation prompt, then your instruction."
@@ -632,6 +667,8 @@ func (m model) promptInputView() string {
 	switch {
 	case newSession:
 		binds = [][2]string{{"enter", "start session"}, newline, {"esc", "cancel"}}
+	case m.draft.scheduled:
+		binds = [][2]string{{"enter", "next: schedule"}, newline, {"esc", "cancel"}}
 	case m.draft.outsideGit:
 		// Pull requests need a repository to look them up in.
 		binds = [][2]string{{"enter", "submit"}, newline, {"esc", "cancel"}}
@@ -710,6 +747,9 @@ func (m model) draftHandoffLine() string {
 // listKeybindText is the browse screen's key bar, at most width wide once the
 // window size is known: the keys needed least are left out first.
 func (m model) listKeybindText(width int) string {
+	if m.showScheduled {
+		return m.scheduledKeybinds(width)
+	}
 	if m.showShelf {
 		return m.fitKeybindBar(width, [][2]string{
 			{"enter", "open"}, {"d", "unshelve"}, {"e", "rename"}, {"tab", "current"},
@@ -718,7 +758,7 @@ func (m model) listKeybindText(width int) string {
 	}
 	binds := [][2]string{
 		{"n", "new"}, {"N", "session"}, {"d", "shelve"}, {"e", "rename"}, {"tab", "shelf"},
-		{"i", "import"}, {"p", "provider"}, {"r", "refresh"},
+		{"s", "scheduled"}, {"i", "import"}, {"p", "provider"}, {"r", "refresh"},
 	}
 	if row := m.selectedRow(); row != nil && row.task != nil &&
 		row.task.CreationStatus == core.TaskCreationStatusFailed {
@@ -726,7 +766,7 @@ func (m model) listKeybindText(width int) string {
 	}
 	binds = append(binds, [2]string{"space", "details"}, [2]string{"x", "clean"}, [2]string{"q", "quit"})
 
-	return m.fitKeybindBar(width, binds, "r", "p", "i", "e", "space", "tab")
+	return m.fitKeybindBar(width, binds, "r", "p", "i", "e", "space", "tab", "s")
 }
 
 // fitKeybindBar renders binds as a key bar, leaving out the droppable keys,
@@ -968,6 +1008,9 @@ func (m model) listCreateStatusView() string {
 	if m.opening {
 		lines = append(lines, stepActiveLine("Reconnecting session...", m.shimmerTick))
 	}
+	if line := m.scheduleStatusLine(); line != "" {
+		lines = append(lines, line)
+	}
 	if m.create.err != nil {
 		lines = append(lines, errorStyle.Render("Error: "+m.create.err.Error()))
 	}
@@ -1035,6 +1078,10 @@ func (m model) cleanupEffectText() string {
 	switch {
 	case row == nil || row.task == nil:
 		return "The tmux session and worktree will be deleted."
+	case row.task.IsScheduled() && row.task.UsesFolderWorkspace():
+		return "The schedule stops and is deleted, and the tmux session is closed. The folder is kept."
+	case row.task.IsScheduled():
+		return "The schedule stops and is deleted, and the tmux session and worktree are removed."
 	case row.task.IsChild():
 		return "The session's tmux window will be closed. The workspace is kept."
 	case row.task.UsesFolderWorkspace():

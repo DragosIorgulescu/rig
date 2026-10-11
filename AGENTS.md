@@ -56,7 +56,7 @@ Hexagonal architecture (Ports & Adapters) with dependency injection.
 - `task_schedules.go`, `scheduler.go` — Scheduled tasks: schedule edits, the scheduler loop (compare-and-swap claims, run records) and hook-driven resolution of a run in flight
 
 ### Adapters (`internal/adapters/`)
-- `handler/tui/` — Bubbletea TUI (root command launches interactive task list; also the provider setup and switch screens)
+- `handler/tui/` — Bubbletea TUI (root command launches interactive task list; also the provider setup and switch screens, and the scheduled list with its schedule step and editor)
 - `client/tmux/` — Tmux session management
 - `client/git/` — Git worktree operations
 - `client/codex/` — Codex implementation of `ProviderClient`

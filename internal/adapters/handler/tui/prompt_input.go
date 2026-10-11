@@ -16,6 +16,10 @@ const (
 	promptInputMaxContentHeight = 10000
 )
 
+// cursorBlinkSpeed is how fast the cursor of a text field blinks. A var so tests,
+// which run batched commands synchronously, need not wait a blink out.
+var cursorBlinkSpeed = 530 * time.Millisecond
+
 func newPromptInput() textarea.Model {
 	input := textarea.New()
 	input.ShowLineNumbers = false
@@ -44,7 +48,7 @@ func newPromptInput() textarea.Model {
 	styles.Cursor.Color = colorAccent
 	styles.Cursor.Shape = tea.CursorBar
 	styles.Cursor.Blink = true
-	styles.Cursor.BlinkSpeed = 530 * time.Millisecond
+	styles.Cursor.BlinkSpeed = cursorBlinkSpeed
 
 	input.SetStyles(styles)
 	return input

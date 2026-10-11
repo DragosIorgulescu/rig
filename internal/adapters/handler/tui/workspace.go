@@ -35,8 +35,11 @@ func (m model) scopeTasks(tasks []*core.Task) ([]*core.Task, int) {
 // the current list is all there is.
 func (m model) scopeLine(totalWidth int) []string {
 	var lines []string
-	if shelf := m.shelfText(); shelf != "" {
+	if shelf := m.shelfText(); shelf != "" && !m.showScheduled {
 		lines = append(lines, dimStyle.Render(truncateStr(shelf, totalWidth)))
+	}
+	if scheduled := m.scheduledText(); scheduled != "" && !m.showShelf {
+		lines = append(lines, dimStyle.Render(truncateStr(scheduled, totalWidth)))
 	}
 	if folders := m.otherFoldersText(); folders != "" {
 		lines = append(lines, dimStyle.Render(truncateStr(folders, totalWidth)))
@@ -102,6 +105,18 @@ func homeRelativePath(path string) string {
 		return "~" + string(filepath.Separator) + rest
 	}
 	return path
+}
+
+// draftWorkspaceText says where the draft's task will run.
+func (m model) draftWorkspaceText() string {
+	switch {
+	case m.draft.outsideGit:
+		return "this folder · not a git repository"
+	case m.draft.inFolder:
+		return "this folder"
+	default:
+		return "new worktree"
+	}
 }
 
 func (m model) draftWorkspaceLine() string {

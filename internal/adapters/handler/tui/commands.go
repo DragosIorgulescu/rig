@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/BaronBonet/rig/internal/core"
@@ -29,11 +30,18 @@ func activityRefreshTickCmd() tea.Cmd {
 func loadTasksCmd(ctx context.Context, frontend core.TaskFrontend, reorder bool) tea.Cmd {
 	return func() tea.Msg {
 		tasks, err := frontend.ListTasks(ctx)
-		return tasksLoadedMsg{
+		msg := tasksLoadedMsg{
 			tasks:   tasks,
 			err:     err,
 			reorder: reorder,
 		}
+		// The schedules come with the Scheduled tasks they belong to, if there
+		// are any.
+		if err == nil && slices.ContainsFunc(tasks, func(task *core.Task) bool { return task.IsScheduled() }) {
+			msg.schedules, msg.scheduleErr = frontend.ListTaskSchedules(ctx)
+			msg.schedulesLoaded = msg.scheduleErr == nil
+		}
+		return msg
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/BaronBonet/rig/internal/core"
 
@@ -20,6 +21,9 @@ type taskRow struct {
 	tokenUsage  *core.TaskTokenUsage
 	pullRequest *core.PRStatus
 	worktrees   []core.TaskWorktree
+	// schedule is the schedule of a Scheduled task; nil for any other task, and
+	// until the schedules have loaded.
+	schedule *core.ScheduledTask
 	// order is where the row ranks, frozen when the row first appeared or the
 	// list was last arranged afresh; live updates to the fields above never
 	// change it, so rows hold still between those moments.
@@ -37,6 +41,8 @@ const (
 	modeSwitchProvider
 	modeImportSession
 	modeRenameTask
+	modeScheduleStep
+	modeScheduleEdit
 )
 
 const defaultBuildVersion = "dev"
@@ -54,6 +60,9 @@ const (
 	opImporting
 	opShelving
 	opRenaming
+	opEditingSchedule
+	opTogglingSchedule
+	opRunningSchedule
 )
 
 const taskActivityPreviewLimit = 6
@@ -100,6 +109,19 @@ type model struct {
 	showShelf bool
 	// shelvedTasks counts the shelved tasks in scope, listed or not.
 	shelvedTasks int
+	// showScheduled lists the Scheduled tasks instead of the current ones.
+	showScheduled bool
+	// scheduledTasks counts the Scheduled tasks in scope, listed or not.
+	scheduledTasks int
+	// scheduleResuming says whether the schedule command in flight resumes a
+	// schedule rather than pauses it.
+	scheduleResuming bool
+	// notice is a note on something that went well, shown until the next key
+	// press.
+	notice string
+	// clock tells the time the schedules are shown against; nil is the real
+	// clock.
+	clock func() time.Time
 
 	// adoptionReloads dampens the reload triggered by a status/record provider
 	// mismatch: one reload per observed mismatch. When the mismatch survives a
@@ -122,6 +144,7 @@ type model struct {
 	providerSwitch switchState
 	sessionImport  importState
 	rename         renameState
+	scheduleForm   scheduleFormState
 
 	// In-flight creation progress; outlives the draft and renders in browse.
 	create createFlowState
@@ -151,6 +174,9 @@ type taskDraft struct {
 	// forTask, when set, makes the draft a fresh session of that existing
 	// task rather than a new task.
 	forTask *core.Task
+	// scheduled makes the draft a new Scheduled task: the composer is followed
+	// by the schedule step.
+	scheduled bool
 	// handoff asks the task's previous session for a handoff note before the
 	// new session starts.
 	handoff bool
@@ -175,7 +201,10 @@ type createFlowState struct {
 	// retry is a fresh session's submitted draft, kept so a session that
 	// fails to start reopens it instead of losing the user's instruction.
 	retry *taskDraft
-	err   error
+	// schedule is a new Scheduled task's submitted schedule step, kept with
+	// retry so that a schedule the daemon refuses reopens the step.
+	schedule *scheduleFormState
+	err      error
 }
 
 // setupFormState is the provider setup screen's working state.
@@ -222,6 +251,11 @@ type tasksLoadedMsg struct {
 	// a refresh, and when the view changes. Any other load leaves the rows
 	// already listed where they are.
 	reorder bool
+	// schedules are the schedules of the Scheduled tasks, loaded with them;
+	// scheduleErr is why they could not be, and schedulesLoaded says they were.
+	schedules       []core.ScheduledTask
+	scheduleErr     error
+	schedulesLoaded bool
 }
 
 // orderSettleMsg ends the wait for live statuses of the load numbered seq.
@@ -580,6 +614,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeRenameTask {
 			return m.updateRename(msg)
 		}
+		if m.isScheduleFormMode() {
+			return m.updateScheduleForm(msg)
+		}
 		return m.updatePromptPaste(msg)
 	case tea.KeyPressMsg:
 		if isForceQuitKey(msg) {
@@ -610,6 +647,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeRenameTask {
 			return m.updateRename(msg)
 		}
+		if m.isScheduleFormMode() {
+			return m.updateScheduleForm(msg)
+		}
 
 		if isQuitKey(msg) {
 			return m.quit()
@@ -618,9 +658,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A displayed error stays until the user acknowledges it with a key
 		// press; background refreshes must not clear it.
 		m.err = nil
+		m.notice = ""
 
 		if m.showShelf && !shelfKey(msg.String()) {
 			return m, nil
+		}
+		if m.showScheduled {
+			if next, cmd, handled := m.updateScheduledList(msg.String()); handled {
+				return next, cmd
+			}
+			if !scheduledKey(msg.String()) {
+				return m, nil
+			}
 		}
 
 		switch msg.String() {
@@ -631,6 +680,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleBack()
 		case "tab":
 			return m.toggleShelf()
+		case "s":
+			return m.toggleScheduled()
 		case "d":
 			return m.moveSelectedTask(false)
 		case "a", "n":
@@ -677,11 +728,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ", "space":
 			m.detailsHidden = !m.detailsHidden
 		case "x":
-			if len(m.rows) == 0 {
-				return m, nil
-			}
-			m.transition(modeCleanupConfirm)
-			return m, nil
+			return m.confirmCleanup()
 		case "enter":
 			if m.showShelf {
 				return m.moveSelectedTask(true)
@@ -713,17 +760,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		selectedTaskID := m.selectedTaskID()
-		current, shelved := splitShelved(msg.tasks)
+		ordinary, scheduled := splitScheduled(msg.tasks)
+		current, shelved := splitShelved(ordinary)
 		listed := current
-		if m.showShelf {
+		switch {
+		case m.showShelf:
 			listed = shelved
+		case m.showScheduled:
+			listed = scheduled
 		}
 		visible, others := m.scopeTasks(listed)
 		m.otherFolderTasks = others
 		shelvedHere, _ := m.scopeTasks(shelved)
 		m.shelvedTasks = len(shelvedHere)
+		scheduledHere, _ := m.scopeTasks(scheduled)
+		m.scheduledTasks = len(scheduledHere)
 		nextRows := rowsFromTasks(visible)
 		carryOverRows(nextRows, m.rows)
+		switch {
+		case msg.schedulesLoaded:
+			attachSchedules(nextRows, msg.schedules)
+		case msg.scheduleErr != nil && m.showScheduled:
+			// The rows keep the schedules they had.
+			m.err = scheduleCommandFailed("could not load the schedules", msg.scheduleErr)
+		}
 		if msg.reorder {
 			// Shown at once, by what is known now; settled once more below.
 			rankRows(nextRows)
@@ -942,6 +1002,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selected = index
 				}
 				m.clampSelection()
+				if m.create.schedule != nil {
+					// A Scheduled task that was made, but not set up, is retried
+					// from its row; making it again would make another.
+					m.create.retry, m.create.schedule = nil, nil
+				}
 			}
 			return m.failCreate(msg.event.Err)
 		case msg.event.Task != nil:
@@ -955,6 +1020,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.endOp()
 		if m.create.err == nil {
+			// Whether the task was made is unknown, so it is not made again.
+			m.create.retry, m.create.schedule = nil, nil
 			return m.failCreate(errors.New("create task stream closed unexpectedly"))
 		}
 		return m, nil
@@ -1022,6 +1089,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.importHintCmd()
 	case activityRefreshTickMsg:
 		cmds := []tea.Cmd{activityRefreshTickCmd()}
+		if m.showScheduled {
+			// Runs are made by the daemon, so the next and latest run change
+			// without the dashboard doing anything.
+			cmds = append(cmds, loadSchedulesCmd(m.statusContext, m.frontend))
+		}
 		if row := m.selectedRow(); row != nil && row.task != nil && taskID(row.task) != "" {
 			id := taskID(row.task)
 			cmds = append(cmds,
@@ -1043,11 +1115,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.shimmerTick++
 		return m, shimmerTickCmd()
 	default:
+		if next, cmd, handled := m.updateScheduleMessage(msg); handled {
+			return next, cmd
+		}
 		if m.mode == modePromptInput {
 			return m.updatePromptInput(msg)
 		}
 		if m.mode == modeRenameTask {
 			return m.updateRename(msg)
+		}
+		if m.isScheduleFormMode() {
+			return m.updateScheduleForm(msg)
 		}
 		return m, nil
 	}
@@ -1070,6 +1148,10 @@ func (m model) View() tea.View {
 		body = m.importSessionView()
 	case modeRenameTask:
 		body = m.renameTaskView()
+	case modeScheduleStep:
+		body = m.scheduleStepView()
+	case modeScheduleEdit:
+		body = m.scheduleEditView()
 	default:
 		body = m.listView()
 	}
@@ -1098,7 +1180,7 @@ func splitShelved(tasks []*core.Task) ([]*core.Task, []*core.Task) {
 // switching work happens on the current list.
 func shelfKey(key string) bool {
 	switch key {
-	case "a", "n", "N", "p", "i", "R":
+	case "a", "n", "N", "p", "i", "R", "s":
 		return false
 	default:
 		return true
@@ -1160,6 +1242,7 @@ func carryOverRows(nextRows []taskRow, currentRows []taskRow) {
 		}
 		nextRows[index].status = previous.status
 		nextRows[index].activity = previous.activity
+		nextRows[index].schedule = previous.schedule
 		nextRows[index].order = previous.order
 	}
 }
@@ -1196,6 +1279,10 @@ func (m model) submitPrompt() (model, tea.Cmd) {
 	// is optional.
 	if prompt == "" && m.draft.forTask == nil {
 		return m, nil
+	}
+	// A Scheduled task is created by the schedule step that follows.
+	if m.draft.scheduled {
+		return m.enterScheduleStep()
 	}
 
 	// Capture the draft's inputs before the transition discards it.
@@ -1251,6 +1338,9 @@ func (m model) submitPrompt() (model, tea.Cmd) {
 // reopens its composer with the user's instruction and options and the error
 // above them, so it can be sent again, in a new window, say.
 func (m model) failCreate(err error) (model, tea.Cmd) {
+	if m.create.schedule != nil && m.create.retry != nil {
+		return m.reopenScheduleStep(err)
+	}
 	retry := m.create.retry
 	m.create.err = err
 	if retry == nil || !m.transition(modePromptInput) {
@@ -1350,8 +1440,9 @@ func (m model) updatePromptInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if typed.String() == "ctrl+p" {
-			if m.draft.forTask != nil {
-				// A new session belongs to its task; there is no source to pick.
+			if m.draft.forTask != nil || m.draft.scheduled {
+				// A new session belongs to its task, and a Scheduled task has no
+				// pull request to start from; there is no source to pick.
 				return m, nil
 			}
 			if m.draft.outsideGit {

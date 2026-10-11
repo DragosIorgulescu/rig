@@ -17,8 +17,8 @@ Use `rig` for the CLI command and Rig for the product or system.
 - Task draft: The in-progress task the TUI user is assembling before
   submission: the prompt text, the chosen provider, its launch options, and
   the optional pull request source; or, for a new session, the continuation
-  prompt and whether to write a handoff. Discarded on cancel; cleared once
-  submitted.
+  prompt and whether to write a handoff; or, for a Scheduled task, the prompt,
+  which the schedule step follows. Discarded on cancel; cleared once submitted.
 - Launch options: The model and effort a Task's provider starts and resumes
   with, chosen when the Task or a new session is composed, kept on the Task,
   and remembered per provider as the preselection for the next launch. Codex
@@ -83,6 +83,11 @@ Use `rig` for the CLI command and Rig for the product or system.
   when it ran and when the schedule fires next. A run missed because the
   daemon was down or the Task was not ready is made once, and the runs between
   are not made up.
+- Scheduled list: The TUI list of Scheduled tasks, apart from the current list
+  and the Shelf, which leave them out. A row shows the task's schedule, when it
+  fires next and how its latest run went, and its details show the prompt in
+  full. It is where a Scheduled task is created, edited, paused, run now and
+  deleted.
 - Session mode: Which Provider session a Scheduled run uses. In `same` the
   Provider stays open in the Task's window and each run sends it the prompt,
   starting it, resuming the latest session, only when none runs there. In `new`
@@ -214,19 +219,19 @@ Use `rig` for the CLI command and Rig for the product or system.
 - Shelving or unshelving a Task moves its Child tasks with it; a Child task
   can also be shelved on its own, which closes only its window.
 - The TUI lists the Tasks that are working first, then the rest, each most
-  recently active first, on the current list and the Shelf alike. A Task is
-  working while its Runtime status is starting, working, or working in the
-  background; its last activity is the latest of its status, its Activity
-  events and its record's update. A task group is listed together, parent
-  first, and ranked by its best member, so a working Child task lifts its
-  whole group. Tasks of one repository or folder stay together, the one with
-  the best-ranked task first.
+  recently active first, on the current list, the Shelf and the Scheduled list
+  alike. A Task is working while its Runtime status is starting, working, or
+  working in the background; its last activity is the latest of its status, its
+  Activity events and its record's update. A task group is listed together,
+  parent first, and ranked by its best member, so a working Child task lifts its
+  whole group. Tasks of one repository or folder stay together, the one with the
+  best-ranked task first.
 - The order is set only when the TUI opens, on a refresh, and when it switches
-  to the Shelf or to every folder: at once, from what is known, and once more
-  when the first Runtime statuses of the listed Tasks have arrived over their
-  subscriptions, or after a short deadline. A live status or Activity event at
-  any other time does not move a row. A Task or Child task new to the list is
-  ranked once, by its record, and holds still from then on.
+  to the Shelf, the Scheduled list or every folder: at once, from what is known,
+  and once more when the first Runtime statuses of the listed Tasks have arrived
+  over their subscriptions, or after a short deadline. A live status or Activity
+  event at any other time does not move a row. A Task or Child task new to the
+  list is ranked once, by its record, and holds still from then on.
 - A Rename changes only the Task's display name and original ask; its slug,
   and so its workspace, branch and tmux session, stays. A provider session
   renames its Task only when the title the user gave it changes, so a Rename
@@ -255,6 +260,13 @@ Use `rig` for the CLI command and Rig for the product or system.
 - A Scheduled run still in flight when the daemon stops is left as it is. The
   next run finds out whether its session is Busy: if so it is skipped and the
   record keeps saying the run is in flight; if not, the new run replaces it.
+- A Scheduled task is created through the composer, which chooses its Provider,
+  launch options and workspace, and then a schedule step, which chooses the
+  cron expression, the Session mode and the Permission mode. The daemon decides
+  whether the schedule is acceptable, and the TUI shows its refusal on the step
+  with what was typed. The Scheduled list shows a schedule as the daemon last
+  recorded it, read again every few seconds while it is shown, and an edit made
+  from a schedule since changed shows the schedule as it is now instead.
 - A Handoff note is written by the Task's latest Provider session of its
   Active provider, and only by a Provider that supports it, whichever Provider
   the new session starts with.
