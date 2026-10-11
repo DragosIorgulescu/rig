@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/BaronBonet/rig/internal/core"
 )
@@ -81,6 +82,20 @@ type renameTaskRequest struct {
 type switchTaskProviderRequest struct {
 	TaskID   string        `json:"task_id"`
 	Provider core.Provider `json:"provider"`
+}
+
+// updateTaskScheduleRequest carries the whole edit: the schedule's cron,
+// prompt, session mode and permission mode flat beside the task, and the
+// UpdatedAt the editor read.
+type updateTaskScheduleRequest struct {
+	TaskID            string    `json:"task_id"`
+	ExpectedUpdatedAt time.Time `json:"expected_updated_at"`
+	core.ScheduleInput
+}
+
+type setTaskScheduleEnabledRequest struct {
+	TaskID  string `json:"task_id"`
+	Enabled bool   `json:"enabled"`
 }
 
 func requiredTaskID(command string, taskID string) (string, error) {
@@ -277,6 +292,54 @@ var opGetLaunchSettings = unaryOp[launchSettingsRequest, *core.LaunchSettings]{
 	},
 }
 
+var opListTaskSchedules = unaryOp[emptyResponse, []core.ScheduledTask]{
+	command:  "list_task_schedules",
+	envelope: "task_schedules_list",
+	call: func(ctx context.Context, svc core.TaskService, _ emptyResponse) ([]core.ScheduledTask, error) {
+		return svc.ListTaskSchedules(ctx)
+	},
+}
+
+var opUpdateTaskSchedule = unaryOp[updateTaskScheduleRequest, *core.ScheduledTask]{
+	command:  "update_task_schedule",
+	envelope: "task_schedule_updated",
+	call: func(ctx context.Context, svc core.TaskService, req updateTaskScheduleRequest) (*core.ScheduledTask, error) {
+		taskID, err := requiredTaskID("update_task_schedule", req.TaskID)
+		if err != nil {
+			return nil, err
+		}
+		return svc.UpdateTaskSchedule(ctx, taskID, req.ScheduleInput, req.ExpectedUpdatedAt)
+	},
+}
+
+var opSetTaskScheduleEnabled = unaryOp[setTaskScheduleEnabledRequest, *core.ScheduledTask]{
+	command:  "set_task_schedule_enabled",
+	envelope: "task_schedule_enabled_set",
+	call: func(
+		ctx context.Context,
+		svc core.TaskService,
+		req setTaskScheduleEnabledRequest,
+	) (*core.ScheduledTask, error) {
+		taskID, err := requiredTaskID("set_task_schedule_enabled", req.TaskID)
+		if err != nil {
+			return nil, err
+		}
+		return svc.SetTaskScheduleEnabled(ctx, taskID, req.Enabled)
+	},
+}
+
+var opRunTaskScheduleNow = unaryOp[taskIDRequest, emptyResponse]{
+	command:  "run_task_schedule_now",
+	envelope: "task_schedule_run_started",
+	call: func(ctx context.Context, svc core.TaskService, req taskIDRequest) (emptyResponse, error) {
+		taskID, err := requiredTaskID("run_task_schedule_now", req.TaskID)
+		if err != nil {
+			return emptyResponse{}, err
+		}
+		return emptyResponse{}, svc.RunTaskScheduleNow(ctx, taskID)
+	},
+}
+
 var opDeleteTask = unaryOp[taskIDRequest, emptyResponse]{
 	command:  "delete_task",
 	envelope: "task_deleted",
@@ -353,6 +416,10 @@ var socketUnaryHandlers = map[string]unaryHandler{
 	opDetectProviders.command:        serveUnary(opDetectProviders),
 	opSwitchTaskProvider.command:     serveUnary(opSwitchTaskProvider),
 	opGetLaunchSettings.command:      serveUnary(opGetLaunchSettings),
+	opListTaskSchedules.command:      serveUnary(opListTaskSchedules),
+	opUpdateTaskSchedule.command:     serveUnary(opUpdateTaskSchedule),
+	opSetTaskScheduleEnabled.command: serveUnary(opSetTaskScheduleEnabled),
+	opRunTaskScheduleNow.command:     serveUnary(opRunTaskScheduleNow),
 	opDeleteTask.command:             serveUnary(opDeleteTask),
 	opListTasks.command:              serveUnary(opListTasks),
 	opLatestTaskStatus.command:       serveUnary(opLatestTaskStatus),

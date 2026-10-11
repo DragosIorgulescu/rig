@@ -18,6 +18,17 @@ type TaskServiceDependencies struct {
 	ProviderConfig       ProviderConfigStore
 	PromptFiles          PromptFileStore
 	EnableWorkspaceSetup bool
+	// ScheduleCalculator works out when schedules fire; without it Scheduled
+	// tasks cannot be created or run.
+	ScheduleCalculator ScheduleCalculator
+	// ScheduleMinInterval is the shortest time allowed between two runs of a
+	// schedule, and SchedulerTick how often the scheduler looks for due runs;
+	// zero is DefaultScheduleMinInterval and DefaultSchedulerTick.
+	ScheduleMinInterval time.Duration
+	SchedulerTick       time.Duration
+	// ReportError is told of failures in the background that nobody is waiting
+	// on, such as a scheduler tick that panicked.
+	ReportError func(error)
 }
 
 // service is the concrete task application service. Composition code holds
@@ -40,6 +51,7 @@ type service struct {
 	creation       *taskCreation
 	observation    *taskObservation
 	worktrees      *taskWorktrees
+	schedules      *taskSchedules
 	operations     *taskOperationCoordinator
 	// sessionExitWait bounds how long replacing a session waits for the
 	// provider to leave the pane after being told to exit; sessionExitPoll
@@ -93,7 +105,7 @@ func NewTaskService(deps TaskServiceDependencies) *service {
 		deps.EnableWorkspaceSetup,
 	)
 
-	return &service{
+	svc := &service{
 		tasks:           deps.Tasks,
 		gitWorktree:     deps.GitWorktree,
 		tmuxSession:     deps.TmuxSession,
@@ -102,7 +114,6 @@ func NewTaskService(deps TaskServiceDependencies) *service {
 		providerConfig:  deps.ProviderConfig,
 		promptFiles:     deps.PromptFiles,
 		launcher:        launcher,
-		creation:        newTaskCreation(deps.Tasks, deps.GitWorktree, launcher, operations),
 		worktrees:       newTaskWorktrees(deps.Tasks, deps.GitWorktree, deps.Providers),
 		operations:      operations,
 		sessionExitWait: 15 * time.Second,
@@ -114,6 +125,18 @@ func NewTaskService(deps TaskServiceDependencies) *service {
 			deps.ProviderConfig,
 		),
 	}
+	svc.schedules = newTaskSchedules(
+		deps.Tasks,
+		launcher,
+		deps.ScheduleCalculator,
+		deps.ScheduleMinInterval,
+		deps.SchedulerTick,
+		deps.ReportError,
+	)
+	svc.schedules.run = svc.RunTaskPrompt
+	svc.creation = newTaskCreation(deps.Tasks, deps.GitWorktree, launcher, operations, svc.schedules)
+
+	return svc
 }
 
 func (s *service) HealthCheck(ctx context.Context) ([]HealthCheck, error) {
@@ -460,8 +483,17 @@ func (s *service) SubscribeTaskStatus(
 	return s.observation.SubscribeTaskStatus(ctx, taskID)
 }
 
+// HandleHookEvent records what a provider hook event says and, when it ends
+// the turn a scheduled run began, resolves the run.
 func (s *service) HandleHookEvent(ctx context.Context, input HookEventInput) error {
-	return s.observation.HandleHookEvent(ctx, input)
+	update, err := s.observation.HandleHookEvent(ctx, input)
+	if err != nil {
+		return err
+	}
+	if update != nil {
+		s.schedules.resolveRun(ctx, *update, input.ErrorText)
+	}
+	return nil
 }
 
 // childTasks lists the Tasks that are sessions of the given Task.

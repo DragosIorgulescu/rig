@@ -159,7 +159,26 @@ func DecodeHookEventInput(now func() time.Time, headerEventName string, body []b
 	input.AgentType = strings.TrimSpace(payload.AgentType)
 	input.NotificationType = strings.TrimSpace(payload.NotificationType)
 	input.BackgroundWork = backgroundWorkFromTasks(payload.BackgroundTasks)
+	if input.EventName == core.HookEventStopFailure {
+		input.ErrorText = stopFailureText(payload)
+	}
 	return input
+}
+
+// stopFailureText is why a turn ended on an error, as the StopFailure payload
+// says it: the error as it was shown in the conversation, else the details of
+// the error, else its kind. It is empty when the payload says none of them.
+func stopFailureText(payload hookPayload) string {
+	for _, text := range []string{
+		strings.TrimSpace(payload.LastAssistantMessage),
+		flattenPayloadText(payload.ErrorDetails),
+		strings.TrimSpace(payload.Error),
+	} {
+		if text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func (r *repository) HookEventToTaskStatus(input core.HookEventInput) (*core.TaskStatusUpdate, error) {
@@ -229,21 +248,26 @@ func backgroundWorkFromTasks(tasks []hookBackgroundTask) core.TaskBackgroundWork
 }
 
 type hookPayload struct {
-	SessionID        string               `json:"session_id"`
-	HookEventName    string               `json:"hook_event_name"`
-	Prompt           string               `json:"prompt"`
-	ToolUseID        string               `json:"tool_use_id"`
-	AgentID          string               `json:"agent_id"`
-	AgentType        string               `json:"agent_type"`
-	Model            string               `json:"model"`
-	Cwd              string               `json:"cwd"`
-	TranscriptPath   string               `json:"transcript_path"`
-	Source           string               `json:"source"`
-	Message          string               `json:"message"`
-	NotificationType string               `json:"notification_type"`
-	ToolInput        hookToolInput        `json:"tool_input"`
-	ToolResponse     json.RawMessage      `json:"tool_response"`
-	BackgroundTasks  []hookBackgroundTask `json:"background_tasks"`
+	SessionID        string `json:"session_id"`
+	HookEventName    string `json:"hook_event_name"`
+	Prompt           string `json:"prompt"`
+	ToolUseID        string `json:"tool_use_id"`
+	AgentID          string `json:"agent_id"`
+	AgentType        string `json:"agent_type"`
+	Model            string `json:"model"`
+	Cwd              string `json:"cwd"`
+	TranscriptPath   string `json:"transcript_path"`
+	Source           string `json:"source"`
+	Message          string `json:"message"`
+	NotificationType string `json:"notification_type"`
+	// Error, ErrorDetails and LastAssistantMessage say why a StopFailure turn
+	// ended.
+	Error                string               `json:"error"`
+	ErrorDetails         json.RawMessage      `json:"error_details"`
+	LastAssistantMessage string               `json:"last_assistant_message"`
+	ToolInput            hookToolInput        `json:"tool_input"`
+	ToolResponse         json.RawMessage      `json:"tool_response"`
+	BackgroundTasks      []hookBackgroundTask `json:"background_tasks"`
 }
 
 type hookToolInput struct {

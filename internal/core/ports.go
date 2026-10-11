@@ -49,6 +49,10 @@ type CreateTaskInput struct {
 	// with; empty means the provider's default.
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
+	// Schedule makes the new Task a Scheduled task that runs the schedule's
+	// prompt, or Prompt when that is empty. Its tmux session is created with
+	// one window and no provider; the first run starts the provider.
+	Schedule *ScheduleInput `json:"schedule,omitempty"`
 }
 
 // Launch returns the launch options the input asks for.
@@ -123,8 +127,12 @@ const (
 // be read by a person: "resumed 3f2a…", "session busy", "the session didn't
 // take the prompt".
 type RunTaskPromptResult struct {
-	Outcome PromptRunOutcome `json:"outcome"`
-	Detail  string           `json:"detail"`
+	// StartedAt is when the prompt was sent, or the provider was launched
+	// with it, for a started run; hook events from before it belong to the
+	// session before.
+	StartedAt time.Time        `json:"started_at,omitzero"`
+	Outcome   PromptRunOutcome `json:"outcome"`
+	Detail    string           `json:"detail"`
 }
 
 type TaskCreateProgressStep string
@@ -215,6 +223,8 @@ type HookEventInput struct {
 	TranscriptPath       string
 	StartSource          string
 	NotificationType     string
+	// ErrorText is why a turn ended on an error, when the event says.
+	ErrorText string
 	// BackgroundWork is the provider work still in flight when a turn ended.
 	// Only turn-end events carry it.
 	BackgroundWork TaskBackgroundWork
@@ -333,6 +343,25 @@ type TaskService interface {
 	// under the window's provider configuration env, and the options each was
 	// last launched with.
 	GetLaunchSettings(ctx context.Context, env ProviderEnv) (*LaunchSettings, error)
+	// ListTaskSchedules returns the schedule of every Scheduled task.
+	ListTaskSchedules(ctx context.Context) ([]ScheduledTask, error)
+	// UpdateTaskSchedule replaces a Scheduled task's cron, prompt, session mode
+	// and permission mode and works out its next run again from now.
+	// expectedUpdatedAt is the UpdatedAt the caller read; the update fails with
+	// ErrScheduleConflict when the schedule has been edited since.
+	UpdateTaskSchedule(
+		ctx context.Context,
+		taskID string,
+		update ScheduleInput,
+		expectedUpdatedAt time.Time,
+	) (*ScheduledTask, error)
+	// SetTaskScheduleEnabled pauses a Scheduled task's schedule or resumes it
+	// from now, without a run for the time it was paused.
+	SetTaskScheduleEnabled(ctx context.Context, taskID string, enabled bool) (*ScheduledTask, error)
+	// RunTaskScheduleNow starts a run of a Scheduled task in the daemon without
+	// waiting for it, whether or not the schedule is paused. It leaves the
+	// next scheduled run alone. How the run went is recorded on the schedule.
+	RunTaskScheduleNow(ctx context.Context, taskID string) error
 }
 
 // HookEventHandler consumes provider hook events inside the daemon process.
@@ -370,8 +399,56 @@ type ProviderConfigStore interface {
 	SaveLaunchDefaults(ctx context.Context, provider Provider, options LaunchOptions) error
 }
 
+// ScheduleCalculator works out when a cron schedule fires. It is the port to
+// the cron library, so the core does not depend on one.
+type ScheduleCalculator interface {
+	// Validate reports why expr is not a schedule that fires.
+	Validate(expr string) error
+	// Next returns the first time after the given time that expr fires, in
+	// local time.
+	Next(expr string, after time.Time) (time.Time, error)
+}
+
+// ScheduledTaskRepository persists the schedules of Scheduled tasks, which
+// are deleted with their Task.
+type ScheduledTaskRepository interface {
+	// CreateScheduledTask stores the schedule of an existing Task.
+	CreateScheduledTask(ctx context.Context, schedule ScheduledTask) error
+	// GetScheduledTask returns a Task's schedule, or nil when it has none.
+	GetScheduledTask(ctx context.Context, taskID string) (*ScheduledTask, error)
+	// ListScheduledTasks returns every schedule.
+	ListScheduledTasks(ctx context.Context) ([]ScheduledTask, error)
+	// UpdateScheduledTask replaces the cron, prompt, session mode, permission
+	// mode, enabled flag, next run and UpdatedAt of a schedule, and nothing
+	// else, so a run in flight is not disturbed. It returns ErrScheduleConflict
+	// when the schedule's UpdatedAt is no longer expectedUpdatedAt, and
+	// ErrScheduleNotFound when there is no schedule.
+	UpdateScheduledTask(ctx context.Context, schedule ScheduledTask, expectedUpdatedAt time.Time) error
+	// ClaimScheduledRun moves an enabled schedule's next run from dueAt to
+	// nextRunAt and reports whether it did. Of several callers claiming the
+	// same run, one wins.
+	ClaimScheduledRun(ctx context.Context, taskID string, dueAt time.Time, nextRunAt time.Time) (bool, error)
+	// StartScheduledRun records that a run began at the given time: it is in
+	// flight and its outcome is running.
+	StartScheduledRun(ctx context.Context, taskID string, at time.Time, detail string) error
+	// SkipScheduledRun records a skipped run, unless a run is in flight, whose
+	// record stays.
+	SkipScheduledRun(ctx context.Context, taskID string, at time.Time, detail string) error
+	// FailScheduledRun records a failed run and ends any run in flight.
+	FailScheduledRun(ctx context.Context, taskID string, at time.Time, detail string) error
+	// ResolveScheduledRun ends the run in flight with the outcome, keeping its
+	// detail when the given one is empty, and reports whether there was one.
+	ResolveScheduledRun(
+		ctx context.Context,
+		taskID string,
+		outcome ScheduledRunOutcome,
+		detail string,
+	) (bool, error)
+}
+
 // TaskRepository persists task records and returns their durable state.
 type TaskRepository interface {
+	ScheduledTaskRepository
 	// HealthCheck verifies that the repository backend is reachable and its
 	// storage-level consistency checks pass.
 	HealthCheck(ctx context.Context) error

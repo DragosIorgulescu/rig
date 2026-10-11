@@ -41,9 +41,10 @@ type fakeTaskService struct {
 	detections []core.ProviderDetection
 	latest     map[string]*core.TaskStatusUpdate
 
-	createSteps []core.TaskCreateProgressStep
-	createTask  *core.Task
-	createErr   error
+	createSteps    []core.TaskCreateProgressStep
+	createTask     *core.Task
+	createErr      error
+	createSchedule *core.ScheduleInput
 
 	newSessionInput   *core.NewTaskSessionInput
 	launchSettings    *core.LaunchSettings
@@ -53,6 +54,11 @@ type fakeTaskService struct {
 	subscribeErr error
 	subscribeCtx chan context.Context
 
+	schedules       []core.ScheduledTask
+	scheduleUpdates []scheduleUpdateCall
+	scheduleEnabled map[string]bool
+	scheduleRuns    []string
+
 	deleted     []string
 	reconnected []string
 	shelved     []string
@@ -60,6 +66,13 @@ type fakeTaskService struct {
 	renamed     map[string]string
 
 	errByOp map[string]error
+}
+
+// scheduleUpdateCall is one UpdateTaskSchedule the fake service received.
+type scheduleUpdateCall struct {
+	taskID            string
+	update            core.ScheduleInput
+	expectedUpdatedAt time.Time
 }
 
 func newFakeTaskService() *fakeTaskService {
@@ -101,6 +114,7 @@ func (f *fakeTaskService) CreateTaskStream(
 ) (<-chan core.TaskCreateEvent, error) {
 	f.mu.Lock()
 	f.createEnv = input.ProviderEnv
+	f.createSchedule = input.Schedule
 	f.tasks = append(f.tasks, f.createTask)
 	f.mu.Unlock()
 
@@ -310,6 +324,51 @@ func (f *fakeTaskService) SwitchTaskProvider(
 		}
 	}
 	return nil, errors.New("task not found: " + taskID)
+}
+
+func (f *fakeTaskService) ListTaskSchedules(context.Context) ([]core.ScheduledTask, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.schedules, f.errByOp["list_task_schedules"]
+}
+
+func (f *fakeTaskService) UpdateTaskSchedule(
+	_ context.Context,
+	taskID string,
+	update core.ScheduleInput,
+	expectedUpdatedAt time.Time,
+) (*core.ScheduledTask, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.scheduleUpdates = append(f.scheduleUpdates, scheduleUpdateCall{taskID, update, expectedUpdatedAt})
+	if err := f.errByOp["update_task_schedule"]; err != nil {
+		return nil, err
+	}
+	return &core.ScheduledTask{TaskID: taskID, ScheduleInput: update, Enabled: true}, nil
+}
+
+func (f *fakeTaskService) SetTaskScheduleEnabled(
+	_ context.Context,
+	taskID string,
+	enabled bool,
+) (*core.ScheduledTask, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.scheduleEnabled == nil {
+		f.scheduleEnabled = map[string]bool{}
+	}
+	f.scheduleEnabled[taskID] = enabled
+	if err := f.errByOp["set_task_schedule_enabled"]; err != nil {
+		return nil, err
+	}
+	return &core.ScheduledTask{TaskID: taskID, Enabled: enabled}, nil
+}
+
+func (f *fakeTaskService) RunTaskScheduleNow(_ context.Context, taskID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.scheduleRuns = append(f.scheduleRuns, taskID)
+	return f.errByOp["run_task_schedule_now"]
 }
 
 // startTestFrontend serves a fake TaskService on a real Unix socket and
@@ -569,6 +628,115 @@ func TestUnaryOperationsRoundTrip(t *testing.T) {
 		require.ErrorContains(t, client.DeleteTask(ctx, ""), "task_id required")
 	})
 
+	t.Run("list task schedules", func(t *testing.T) {
+		due := time.Date(2026, time.October, 12, 9, 0, 0, 0, time.UTC)
+		svc.mu.Lock()
+		svc.schedules = []core.ScheduledTask{{
+			TaskID: "task-1",
+			ScheduleInput: core.ScheduleInput{
+				Cron: "0 9 * * *", Prompt: "triage the open issues\nthen summarise",
+				SessionMode: core.PromptRunSessionSame, PermissionMode: core.TaskPermissionModeAcceptEdits,
+			},
+			Enabled:      true,
+			NextRunAt:    due,
+			RunState:     core.ScheduledRunStateRunning,
+			RunStartedAt: due.Add(-24 * time.Hour),
+			LastRunAt:    due.Add(-24 * time.Hour),
+			LastOutcome:  core.ScheduledRunRunning,
+			LastDetail:   "sent to the running session",
+			CreatedAt:    due.Add(-48 * time.Hour),
+			UpdatedAt:    due.Add(-47 * time.Hour),
+		}}
+		svc.mu.Unlock()
+
+		schedules, err := client.ListTaskSchedules(ctx)
+
+		require.NoError(t, err)
+		require.Equal(t, svc.schedules, schedules, "every field survives the wire")
+	})
+
+	t.Run("update task schedule sends the whole edit and the version it was made from", func(t *testing.T) {
+		readAt := time.Date(2026, time.October, 11, 8, 15, 30, 123456789, time.UTC)
+		update := core.ScheduleInput{
+			Cron: "*/30 * * * *", Prompt: "check the deploy", SessionMode: core.PromptRunSessionNew,
+			PermissionMode: core.TaskPermissionModeBypass,
+		}
+
+		schedule, err := client.UpdateTaskSchedule(ctx, "task-1", update, readAt)
+
+		require.NoError(t, err)
+		require.Equal(t, update, schedule.ScheduleInput)
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		require.Equal(t, []scheduleUpdateCall{{"task-1", update, readAt}}, svc.scheduleUpdates)
+		require.True(t, svc.scheduleUpdates[0].expectedUpdatedAt.Equal(readAt), "nanoseconds survive the wire")
+	})
+
+	t.Run("update task schedule requires task id", func(t *testing.T) {
+		_, err := client.UpdateTaskSchedule(ctx, " ", core.ScheduleInput{}, time.Time{})
+		require.ErrorContains(t, err, "task_id required")
+	})
+
+	t.Run("an edit conflict is still a conflict on this side of the socket", func(t *testing.T) {
+		svc.mu.Lock()
+		svc.errByOp["update_task_schedule"] = core.ErrScheduleConflict
+		svc.mu.Unlock()
+		_, err := client.UpdateTaskSchedule(ctx, "task-1", core.ScheduleInput{Cron: "@daily"}, time.Now())
+		require.ErrorIs(t, err, core.ErrScheduleConflict)
+
+		svc.mu.Lock()
+		svc.errByOp["update_task_schedule"] = errors.New("schedule \"nope\": not a cron schedule")
+		svc.mu.Unlock()
+		_, err = client.UpdateTaskSchedule(ctx, "task-1", core.ScheduleInput{Cron: "nope"}, time.Now())
+		require.ErrorContains(t, err, "not a cron schedule")
+		require.NotErrorIs(t, err, core.ErrScheduleConflict)
+
+		svc.mu.Lock()
+		delete(svc.errByOp, "update_task_schedule")
+		svc.mu.Unlock()
+	})
+
+	t.Run("pause and resume a task schedule", func(t *testing.T) {
+		paused, err := client.SetTaskScheduleEnabled(ctx, "task-1", false)
+		require.NoError(t, err)
+		require.False(t, paused.Enabled, "false is sent, not dropped as a zero value")
+
+		resumed, err := client.SetTaskScheduleEnabled(ctx, "task-1", true)
+		require.NoError(t, err)
+		require.True(t, resumed.Enabled)
+
+		_, err = client.SetTaskScheduleEnabled(ctx, "", true)
+		require.ErrorContains(t, err, "task_id required")
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		require.Equal(t, map[string]bool{"task-1": true}, svc.scheduleEnabled)
+	})
+
+	t.Run("a pause that meets an edit is a conflict on this side of the socket", func(t *testing.T) {
+		svc.mu.Lock()
+		svc.errByOp["set_task_schedule_enabled"] = core.ErrScheduleConflict
+		svc.mu.Unlock()
+		_, err := client.SetTaskScheduleEnabled(ctx, "task-1", false)
+		svc.mu.Lock()
+		delete(svc.errByOp, "set_task_schedule_enabled")
+		svc.mu.Unlock()
+		require.ErrorIs(t, err, core.ErrScheduleConflict)
+	})
+
+	t.Run("run a task schedule now", func(t *testing.T) {
+		require.NoError(t, client.RunTaskScheduleNow(ctx, "task-1"))
+		require.ErrorContains(t, client.RunTaskScheduleNow(ctx, " "), "task_id required")
+
+		svc.mu.Lock()
+		svc.errByOp["run_task_schedule_now"] = errors.New("the schedule is already being run")
+		svc.mu.Unlock()
+		require.ErrorContains(t, client.RunTaskScheduleNow(ctx, "task-1"), "already being run")
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		delete(svc.errByOp, "run_task_schedule_now")
+		require.Equal(t, []string{"task-1", "task-1"}, svc.scheduleRuns)
+	})
+
 	t.Run("service errors surface as client errors", func(t *testing.T) {
 		svc.mu.Lock()
 		svc.errByOp["list_tasks"] = errors.New("repository offline")
@@ -613,6 +781,47 @@ func TestCreateTaskStreamRoundTrip(t *testing.T) {
 		require.Equal(t, core.TaskCreateProgressCreatingWorktree, got[1].Progress.Step)
 		require.NotNil(t, got[2].Task)
 		require.Equal(t, "task-1", got[2].Task.ID)
+	})
+
+	t.Run("carries the schedule of a scheduled task", func(t *testing.T) {
+		svc := newFakeTaskService()
+		svc.createTask = &core.Task{ID: "task-1", Kind: core.TaskKindScheduled}
+		client := startTestFrontend(t, svc)
+		schedule := core.ScheduleInput{
+			Cron: "0 9 * * 1-5", Prompt: "triage the open issues", SessionMode: core.PromptRunSessionSame,
+			PermissionMode: core.TaskPermissionModeAcceptEdits,
+		}
+
+		events, err := client.CreateTaskStream(context.Background(), core.CreateTaskInput{
+			Cwd: "/tmp/repo", Prompt: "triage the open issues", Provider: core.ProviderClaude, Schedule: &schedule,
+		})
+		require.NoError(t, err)
+
+		var got []core.TaskCreateEvent
+		for event := range events {
+			got = append(got, event)
+		}
+		require.Len(t, got, 1)
+		require.Equal(t, core.TaskKindScheduled, got[0].Task.Kind, "the kind survives the wire")
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		require.Equal(t, &schedule, svc.createSchedule)
+	})
+
+	t.Run("a task without a schedule is created without one", func(t *testing.T) {
+		svc := newFakeTaskService()
+		svc.createTask = &core.Task{ID: "task-1"}
+		client := startTestFrontend(t, svc)
+
+		events, err := client.CreateTaskStream(context.Background(), core.CreateTaskInput{
+			Cwd: "/tmp/repo", Prompt: "add retries", Provider: core.ProviderCodex,
+		})
+		require.NoError(t, err)
+		for range events {
+		}
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		require.Nil(t, svc.createSchedule)
 	})
 
 	t.Run("terminal error carries partial task for retry", func(t *testing.T) {

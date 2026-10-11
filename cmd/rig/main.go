@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/BaronBonet/rig/internal/adapters/client/cronschedule"
 	"github.com/BaronBonet/rig/internal/adapters/client/git"
 	"github.com/BaronBonet/rig/internal/adapters/client/github"
 	"github.com/BaronBonet/rig/internal/adapters/client/tmux"
@@ -533,6 +534,10 @@ func serveTaskDaemon(
 		EnableWorkspaceSetup: true,
 		ProviderConfig:       providerConfig,
 		PromptFiles:          promptfile.New(filepath.Dir(cfg.SQLite.Path)),
+		ScheduleCalculator:   cronschedule.New(),
+		ScheduleMinInterval:  cfg.Scheduler.MinInterval,
+		SchedulerTick:        cfg.Scheduler.Tick,
+		ReportError:          func(err error) { fmt.Fprintln(os.Stderr, err) },
 	})
 
 	for _, refreshErr := range providerregistry.RefreshProviderEnvironments(ctx, providers, providerConfig) {
@@ -541,6 +546,9 @@ func serveTaskDaemon(
 	for _, refreshErr := range service.RefreshTaskWorkspaceHooks(ctx) {
 		fmt.Fprintln(os.Stderr, refreshErr)
 	}
+
+	// The scheduler runs for as long as the daemon does.
+	go service.RunScheduler(ctx)
 
 	adapter := taskdaemon.New(cfg.Daemon)
 

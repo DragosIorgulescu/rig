@@ -17,6 +17,9 @@ func (s *service) shelveTask(ctx context.Context, taskID string) error {
 	if err != nil {
 		return err
 	}
+	if err := refuseScheduledTask(task, "be shelved"); err != nil {
+		return err
+	}
 	if task.CreationStatus == TaskCreationStatusCreating {
 		return fmt.Errorf("%q is still being created; shelve it once it is ready", task.DisplayName)
 	}

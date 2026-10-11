@@ -65,7 +65,28 @@ Use `rig` for the CLI command and Rig for the product or system.
   Each Provider maps the mode to its own launch flags, and refuses one it
   cannot honour, such as `accept_edits` for Codex. It applies when the Provider
   is started for a run, not to a session that is already running, and is not
-  kept on the Task.
+  kept on the Task record: a Scheduled task keeps it on its schedule.
+- Scheduled task: A Task of its own kind that gives its Provider a stored
+  prompt on a cron schedule, in local time. It is listed apart from ordinary
+  Tasks and is always kept: its Session is created when it is, with one window
+  and a shell in it, no editor window and no Child tasks, and it is never
+  shelved. Its schedule holds the cron expression, the prompt, the Session
+  mode and the Permission mode, beside the Task's usual Provider, launch
+  options and workspace. A schedule never fires closer together than the
+  minimum interval, five minutes unless configured otherwise.
+- Scheduled run: One Prompt run of a Scheduled task, made when its schedule
+  comes due or when the user asks for it now. It is skipped only while the
+  Task's session is Busy. A run that started is in flight until a hook says the
+  turn it began is over: a Stop completes it, a StopFailure or the end of the
+  session fails it. Its latest outcome is kept on the schedule as `running`,
+  `completed`, `skipped` or `failed`, with the reason for the last two, beside
+  when it ran and when the schedule fires next. A run missed because the
+  daemon was down or the Task was not ready is made once, and the runs between
+  are not made up.
+- Session mode: Which Provider session a Scheduled run uses. In `same` the
+  Provider stays open in the Task's window and each run sends it the prompt,
+  starting it, resuming the latest session, only when none runs there. In `new`
+  each run ends whatever session is in the window and starts a fresh one.
 - Handoff note: A note the previous provider session writes, without a
   terminal on a fork that is not saved, for a new session to start from: goal,
   state, decisions, where things are, gotchas, next step. Kept under Rig's
@@ -223,6 +244,17 @@ Use `rig` for the CLI command and Rig for the product or system.
 - A Prompt run in the same session resumes the Task's latest Provider session
   only when it belongs to the Task's Active provider; otherwise it starts a
   fresh one.
+- A Scheduled task has exactly one schedule, which goes with the Task when it
+  is deleted. Editing the schedule works out its next run again from now, and
+  an edit made from a version of the schedule since changed is refused. Pausing
+  a schedule keeps its record; resuming it runs next at the first time after
+  now.
+- A Scheduled run is claimed before it is made: of several callers looking at
+  the same due run, one makes it. The user may also run a schedule now, paused
+  or not, which leaves the next scheduled run as it was.
+- A Scheduled run still in flight when the daemon stops is left as it is. The
+  next run finds out whether its session is Busy: if so it is skipped and the
+  record keeps saying the run is in flight; if not, the new run replaces it.
 - A Handoff note is written by the Task's latest Provider session of its
   Active provider, and only by a Provider that supports it, whichever Provider
   the new session starts with.
@@ -255,6 +287,7 @@ Use `rig` for the CLI command and Rig for the product or system.
 - Keep durable task fields separate from live runtime observations in design
   discussions.
 - Use "prompt run" only for giving a Task's Provider a stored prompt; the
-  work it does is still the Task's.
+  work it does is still the Task's. A prompt run made by a schedule is a
+  "scheduled run".
 - Use "daemon" for the background process and "TUI" for the foreground
   terminal interface.

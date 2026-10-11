@@ -206,6 +206,85 @@ func TestRepositoryStartTaskSession_LeavesShellIdleWhenLaunchCommandIsEmpty(t *t
 	require.NoError(t, err)
 }
 
+func TestRepositoryStartTaskSession_CreatesAScheduledTasksSessionWithItsOneWindowAndNoEditor(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	repo.sleep = func(time.Duration) {}
+
+	// The strict mock fails on any further call, an editor window included.
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{}, errors.New("no session"),
+			"has-session", "-t", "=repo_task",
+		),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"new-session", "-d", "-s", "repo_task", "-n", "task", "-c", "/tmp/repo-task",
+			"-e", "RIG_TASK_ID=task-123",
+		),
+	)
+
+	err := repo.StartTaskSession(context.Background(), &core.Task{
+		ID:           "task-123",
+		Kind:         core.TaskKindScheduled,
+		TmuxSession:  "repo_task",
+		WorktreePath: "/tmp/repo-task",
+	}, core.TaskSessionLaunchSpec{})
+
+	require.NoError(t, err)
+}
+
+func TestRepositoryStartTaskSession_LaunchesAScheduledRunIntoAFreshSessionWithoutAnEditorWindow(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	repo.sleep = func(time.Duration) {}
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{}, errors.New("no session"),
+			"has-session", "-t", "=repo_task",
+		),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"new-session", "-d", "-s", "repo_task", "-n", "task", "-c", "/tmp/repo-task",
+			"-e", "RIG_TASK_ID=task-123",
+		),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"send-keys", "-t", "=repo_task:task", "claude", "C-m",
+		),
+	)
+
+	err := repo.StartTaskSession(context.Background(), &core.Task{
+		ID:           "task-123",
+		Kind:         core.TaskKindScheduled,
+		TmuxSession:  "repo_task",
+		WorktreePath: "/tmp/repo-task",
+	}, core.TaskSessionLaunchSpec{Command: []string{"claude"}})
+
+	require.NoError(t, err)
+}
+
+func TestRepositoryStartTaskSession_GivesAnOrdinaryTaskItsEditorWindowStill(t *testing.T) {
+	runner := subprocess.NewMockRunner(t)
+	repo := New(runner).(*repository)
+	repo.sleep = func(time.Duration) {}
+
+	mock.InOrder(
+		expectTmuxRun(runner, subprocess.Result{}, errors.New("no session"),
+			"has-session", "-t", "=repo_task",
+		),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"new-session", "-d", "-s", "repo_task", "-n", "task", "-c", "/tmp/repo-task",
+		),
+		expectTmuxRun(runner, subprocess.Result{}, nil,
+			"new-window", "-d", "-t", "=repo_task", "-n", "editor", "-c", "/tmp/repo-task",
+		),
+	)
+
+	err := repo.StartTaskSession(context.Background(), &core.Task{
+		TmuxSession:  "repo_task",
+		WorktreePath: "/tmp/repo-task",
+	}, core.TaskSessionLaunchSpec{})
+
+	require.NoError(t, err)
+}
+
 func TestRepositoryStartTaskSession_ExportsTaskIDToTheSessionEnvironment(t *testing.T) {
 	runner := subprocess.NewMockRunner(t)
 	repo := New(runner).(*repository)

@@ -20,6 +20,7 @@ type taskCreation struct {
 	gitWorktree GitWorktreeClient
 	launcher    *sessionLauncher
 	operations  *taskOperationCoordinator
+	schedules   *taskSchedules
 }
 
 func newTaskCreation(
@@ -27,12 +28,14 @@ func newTaskCreation(
 	gitWorktree GitWorktreeClient,
 	launcher *sessionLauncher,
 	operations *taskOperationCoordinator,
+	schedules *taskSchedules,
 ) *taskCreation {
 	return &taskCreation{
 		tasks:       tasks,
 		gitWorktree: gitWorktree,
 		launcher:    launcher,
 		operations:  operations,
+		schedules:   schedules,
 	}
 }
 
@@ -84,6 +87,9 @@ func (c *taskCreation) CreateTaskWithProgress(
 	input CreateTaskInput,
 	reporter TaskCreateProgressReporter,
 ) (*Task, error) {
+	if input.Schedule != nil && input.Source.PullRequest != nil {
+		return nil, fmt.Errorf("a scheduled task cannot be created from a pull request")
+	}
 	if input.Source.PullRequest == nil && c.wantsFolderTask(input) {
 		return c.createFolderTask(ctx, input, reporter)
 	}
@@ -140,7 +146,7 @@ func (c *taskCreation) retryTaskCreationWithProgress(
 			}
 			return c.createTaskWorktree(ctx, task, settings)
 		},
-		c.launcher.resumeStartSession,
+		c.retryStartSession(task),
 	), task.CreationStep)
 	if !ok {
 		return nil, fmt.Errorf("task creation failed step %q is not retryable", task.CreationStep)
@@ -162,9 +168,13 @@ func (c *taskCreation) createTaskFromPrompt(
 	if err != nil {
 		return nil, err
 	}
+	schedule, err := c.prepareSchedule(input, provider, providerClient)
+	if err != nil {
+		return nil, err
+	}
 
 	reportTaskCreateProgress(reporter, TaskCreateProgressSuggestingName)
-	suggestion, err := suggestTaskName(ctx, providerClient, input.Prompt, input.ProviderEnv)
+	suggestion, err := suggestTaskName(ctx, providerClient, namingPrompt(input, schedule), input.ProviderEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -191,8 +201,9 @@ func (c *taskCreation) createTaskFromPrompt(
 	task.Prompt = input.Prompt
 	task.ProviderEnv = input.ProviderEnv
 	task.SetLaunch(input.Launch())
+	c.markScheduled(task, schedule)
 
-	if err := c.tasks.CreateTask(ctx, task); err != nil {
+	if err := c.createTaskRecord(ctx, task, schedule); err != nil {
 		return nil, err
 	}
 	c.launcher.rememberLaunchDefaults(ctx, provider, task.Launch())
@@ -232,9 +243,13 @@ func (c *taskCreation) createFolderTask(
 	if err != nil {
 		return nil, err
 	}
+	schedule, err := c.prepareSchedule(input, provider, providerClient)
+	if err != nil {
+		return nil, err
+	}
 
 	reportTaskCreateProgress(reporter, TaskCreateProgressSuggestingName)
-	suggestion, err := suggestTaskName(ctx, providerClient, input.Prompt, input.ProviderEnv)
+	suggestion, err := suggestTaskName(ctx, providerClient, namingPrompt(input, schedule), input.ProviderEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -255,8 +270,9 @@ func (c *taskCreation) createFolderTask(
 	task.Prompt = input.Prompt
 	task.ProviderEnv = input.ProviderEnv
 	task.SetLaunch(input.Launch())
+	c.markScheduled(task, schedule)
 
-	if err := c.tasks.CreateTask(ctx, task); err != nil {
+	if err := c.createTaskRecord(ctx, task, schedule); err != nil {
 		return nil, err
 	}
 	c.launcher.rememberLaunchDefaults(ctx, provider, task.Launch())
@@ -339,7 +355,70 @@ func (c *taskCreation) creationSteps(
 	repoRoot string,
 	createWorktree func(context.Context) error,
 ) []taskCreationStepAction {
-	return c.creationStepsWith(task, repoRoot, createWorktree, c.launcher.startSession)
+	start := c.launcher.startSession
+	if task.IsScheduled() {
+		start = c.launcher.startIdleSession
+	}
+	return c.creationStepsWith(task, repoRoot, createWorktree, start)
+}
+
+// retryStartSession is the session step of a retried creation.
+func (c *taskCreation) retryStartSession(task *Task) func(context.Context, *Task) (*Task, error) {
+	if task.IsScheduled() {
+		return c.launcher.startIdleSession
+	}
+	return c.launcher.resumeStartSession
+}
+
+// prepareSchedule checks the schedule a Scheduled task is created with, before
+// anything is created for it. It returns nil for a Task that is not scheduled.
+func (c *taskCreation) prepareSchedule(
+	input CreateTaskInput,
+	provider Provider,
+	providerClient ProviderClient,
+) (*ScheduledTask, error) {
+	if input.Schedule == nil {
+		return nil, nil
+	}
+	// Only the provider's launch matters here, to see it accepts the
+	// permission mode; the Task itself does not exist yet.
+	stub := &Task{Provider: provider, ProviderEnv: input.ProviderEnv}
+	stub.SetLaunch(input.Launch())
+	return c.schedules.prepare(*input.Schedule, input.Prompt, stub, providerClient)
+}
+
+// namingPrompt is the prompt a new Task is named after: the one a Scheduled
+// task will run.
+func namingPrompt(input CreateTaskInput, schedule *ScheduledTask) string {
+	if schedule != nil {
+		return schedule.Prompt
+	}
+	return input.Prompt
+}
+
+// markScheduled makes the new Task a Scheduled task when it has a schedule. Its
+// prompt lives in the schedule, which an edit changes, so the Task keeps none:
+// there is no first prompt to type into a session or to brief a new one with.
+func (c *taskCreation) markScheduled(task *Task, schedule *ScheduledTask) {
+	if schedule == nil {
+		return
+	}
+	task.Kind = TaskKindScheduled
+	task.Prompt = ""
+}
+
+// createTaskRecord stores a new Task, with its schedule when it has one. The
+// schedule is stored with the Task, ahead of the setup steps, so a creation
+// that fails and is retried does not need the schedule again; the scheduler
+// leaves the Task alone until it is ready.
+func (c *taskCreation) createTaskRecord(ctx context.Context, task *Task, schedule *ScheduledTask) error {
+	if err := c.tasks.CreateTask(ctx, task); err != nil {
+		return err
+	}
+	if schedule == nil {
+		return nil
+	}
+	return c.schedules.insert(ctx, task, schedule)
 }
 
 func (c *taskCreation) creationStepsWith(
@@ -511,7 +590,13 @@ func (c *taskCreation) markReady(ctx context.Context, task *Task) error {
 	task.CreationStep = ""
 	task.CreationError = ""
 	task.UpdatedAt = time.Now().UTC()
-	return c.tasks.UpdateTask(ctx, task)
+	if err := c.tasks.UpdateTask(ctx, task); err != nil {
+		return err
+	}
+	if task.IsScheduled() {
+		c.schedules.poke()
+	}
+	return nil
 }
 
 func newPromptTaskRecord(

@@ -3,8 +3,8 @@ insert into tasks (
   id, slug, prompt, display_name, repo_root, repo_name, branch_name,
   worktree_path, tmux_session, provider, creation_status, creation_step,
   creation_error, created_at, updated_at, workspace_kind, provider_env,
-  model, effort, parent_id, tmux_window, shelved_at, session_title
-) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+  model, effort, parent_id, tmux_window, shelved_at, session_title, kind
+) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: DeleteTask :exec
 delete from tasks
@@ -33,7 +33,8 @@ update tasks set
   parent_id = ?,
   tmux_window = ?,
   shelved_at = ?,
-  session_title = ?
+  session_title = ?,
+  kind = ?
 where id = ?;
 
 -- name: ListTasks :many
@@ -41,6 +42,6 @@ select
   id, slug, prompt, display_name, repo_root, repo_name, branch_name,
   worktree_path, tmux_session, provider, creation_status, creation_step,
   creation_error, created_at, updated_at, workspace_kind, provider_env,
-  model, effort, parent_id, tmux_window, shelved_at, session_title
+  model, effort, parent_id, tmux_window, shelved_at, session_title, kind
 from tasks
 order by created_at asc;

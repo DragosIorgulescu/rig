@@ -238,6 +238,16 @@ func (l *sessionLauncher) resumeStartSession(ctx context.Context, task *Task) (*
 	return l.launchSession(ctx, task, true)
 }
 
+// startIdleSession creates the task's tmux session and starts no provider in
+// it, for a Scheduled task: its first run starts the provider. The window is
+// left at a shell.
+func (l *sessionLauncher) startIdleSession(ctx context.Context, task *Task) (*Task, error) {
+	if err := l.tmuxSession.StartTaskSession(ctx, task, TaskSessionLaunchSpec{}); err != nil {
+		return task, fmt.Errorf("start task session: %w", err)
+	}
+	return task, nil
+}
+
 func (l *sessionLauncher) launchSession(ctx context.Context, task *Task, reuseRunning bool) (*Task, error) {
 	_, providerClient, err := l.resolveProvider(ctx, task.Provider)
 	if err != nil {

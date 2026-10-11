@@ -17,6 +17,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.2
 	github.com/caarlos0/env/v11 v11.4.0
 	github.com/pressly/goose/v3 v3.27.0
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sys v0.42.0

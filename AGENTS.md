@@ -53,6 +53,7 @@ Hexagonal architecture (Ports & Adapters) with dependency injection.
 - `ports.go` — All adapter interfaces: `TaskRepository`, `RepoClient`, `SessionClient`, `ProviderClient`, `PRStatusChecker`, etc.
 - `service.go` — Business logic orchestration. All task lifecycle methods live here.
 - `errors.go` — Domain-specific errors
+- `task_schedules.go`, `scheduler.go` — Scheduled tasks: schedule edits, the scheduler loop (compare-and-swap claims, run records) and hook-driven resolution of a run in flight
 
 ### Adapters (`internal/adapters/`)
 - `handler/tui/` — Bubbletea TUI (root command launches interactive task list; also the provider setup and switch screens)
@@ -61,6 +62,7 @@ Hexagonal architecture (Ports & Adapters) with dependency injection.
 - `client/codex/` — Codex implementation of `ProviderClient`
 - `client/claude/` — Claude Code implementation of `ProviderClient` (workspace-scoped hook registration)
 - `client/github/` — PR status checks
+- `client/cronschedule/` — `ScheduleCalculator` over robfig/cron's standard parser, in local time (Scheduled tasks)
 - `registry/` — Provider client and hook-route composition for all supported providers
 - `repository/sqlite/` — SQLite persistence (goose migrations, sqlc-generated queries)
 - `repository/userconfig/` — User-level provider setup config (`~/.config/rig/config.json`)
@@ -68,7 +70,7 @@ Hexagonal architecture (Ports & Adapters) with dependency injection.
 - `taskdaemon/` — Daemon process, Unix socket frontend, and hook HTTP server
 
 ### Infrastructure (`internal/infrastructure/`)
-- `config.go` — Env var parsing (`RIG_PROVIDER`, `RIG_CODEX_BINARY`, `RIG_CLAUDE_BINARY`, `RIG_USER_CONFIG_PATH`, `RIG_SQLITE_PATH`, `RIG_DAEMON_HOOK_LISTEN_ADDRESS`, etc.)
+- `config.go` — Env var parsing (`RIG_PROVIDER`, `RIG_CODEX_BINARY`, `RIG_CLAUDE_BINARY`, `RIG_USER_CONFIG_PATH`, `RIG_SQLITE_PATH`, `RIG_DAEMON_HOOK_LISTEN_ADDRESS`, `RIG_SCHEDULER_TICK` (default 30s), `RIG_SCHEDULER_MIN_INTERVAL` (default 5m), etc.)
 
 ### Entry point (`cmd/rig/main.go`)
 - Wires all adapters into `core.Service` via constructor injection

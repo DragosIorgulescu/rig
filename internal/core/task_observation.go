@@ -214,33 +214,35 @@ func (o *taskObservation) SubscribeTaskStatus(
 	return o.statusObserver.SubscribeTaskStatus(ctx, strings.TrimSpace(taskID))
 }
 
-func (o *taskObservation) HandleHookEvent(ctx context.Context, input HookEventInput) error {
+// HandleHookEvent records a hook event, and returns the status update it
+// drove, or nil when it drove none.
+func (o *taskObservation) HandleHookEvent(ctx context.Context, input HookEventInput) (*TaskStatusUpdate, error) {
 	if input.Provider == "" {
-		return ErrUnmanagedHookEvent
+		return nil, ErrUnmanagedHookEvent
 	}
 
 	providerClient, err := supportedProviderClient(o.providers, input.Provider)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Hook routes exist for every supported provider, so observation decides
 	// here whether an incoming hook is actionable: hooks from providers the
 	// user has not configured are ignored without task changes.
 	if o.providerConfig == nil {
-		return fmt.Errorf("provider config store not configured")
+		return nil, fmt.Errorf("provider config store not configured")
 	}
 	setup, err := o.providerConfig.GetProviderSetup(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if setup == nil || !setup.IsConfigured(input.Provider) {
-		return ErrUnmanagedHookEvent
+		return nil, ErrUnmanagedHookEvent
 	}
 
 	resolvedTaskID, err := o.resolveHookTaskID(ctx, input)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	input.TaskID = resolvedTaskID
 
@@ -251,7 +253,7 @@ func (o *taskObservation) HandleHookEvent(ctx context.Context, input HookEventIn
 			// this task's workspace, so it becomes the active provider immediately.
 			// Rig's tmux session reference is intentionally left untouched.
 			if _, adoptErr := recordActiveProvider(ctx, o.tasks, task, input.Provider); adoptErr != nil {
-				return adoptErr
+				return nil, adoptErr
 			}
 		} else {
 			// Late hooks from a provider that is no longer active may still record
@@ -261,31 +263,34 @@ func (o *taskObservation) HandleHookEvent(ctx context.Context, input HookEventIn
 	}
 
 	if err := o.recordHookSession(ctx, input); err != nil {
-		return err
+		return nil, err
 	}
 	if err := o.recordHookActivity(ctx, input); err != nil {
-		return err
+		return nil, err
 	}
 	if !drivesRuntimeStatus {
-		return nil
+		return nil, nil
 	}
 	if err := o.adoptSessionTitle(ctx, providerClient, input); err != nil {
-		return err
+		return nil, err
 	}
 
 	update, err := providerClient.HookEventToTaskStatus(input)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if update == nil {
-		return nil
+		return nil, nil
 	}
 	normalizeProviderHookStatusUpdate(update, input)
 	if update.TaskID == "" {
-		return fmt.Errorf("task status update task ID is required")
+		return nil, fmt.Errorf("task status update task ID is required")
 	}
 
-	return o.tasks.UpsertTaskStatus(ctx, *update)
+	if err := o.tasks.UpsertTaskStatus(ctx, *update); err != nil {
+		return nil, err
+	}
+	return update, nil
 }
 
 // isProviderAdoptionEvent reports whether a hook event may adopt a manually

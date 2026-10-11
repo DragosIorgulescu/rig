@@ -51,6 +51,9 @@ func (s *service) newTaskSession(
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseScheduledTask(task, "start a new session"); err != nil {
+		return nil, err
+	}
 	if task.CreationStatus != TaskCreationStatusReady {
 		return nil, fmt.Errorf("task is not ready: finish or retry its creation first")
 	}

@@ -151,6 +151,52 @@ func (r *healthCheckRepository) SubscribeTaskStatus(context.Context, string) (<-
 	return nil, errHealthCheckRepositoryOnly
 }
 
+func (r *healthCheckRepository) CreateScheduledTask(context.Context, core.ScheduledTask) error {
+	return errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) GetScheduledTask(context.Context, string) (*core.ScheduledTask, error) {
+	return nil, errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) ListScheduledTasks(context.Context) ([]core.ScheduledTask, error) {
+	return nil, errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) UpdateScheduledTask(context.Context, core.ScheduledTask, time.Time) error {
+	return errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) ClaimScheduledRun(
+	context.Context,
+	string,
+	time.Time,
+	time.Time,
+) (bool, error) {
+	return false, errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) StartScheduledRun(context.Context, string, time.Time, string) error {
+	return errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) SkipScheduledRun(context.Context, string, time.Time, string) error {
+	return errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) FailScheduledRun(context.Context, string, time.Time, string) error {
+	return errHealthCheckRepositoryOnly
+}
+
+func (r *healthCheckRepository) ResolveScheduledRun(
+	context.Context,
+	string,
+	core.ScheduledRunOutcome,
+	string,
+) (bool, error) {
+	return false, errHealthCheckRepositoryOnly
+}
+
 func (r *repository) HealthCheck(ctx context.Context) error {
 	if r == nil || r.db == nil {
 		return fmt.Errorf("sqlite repository not configured")

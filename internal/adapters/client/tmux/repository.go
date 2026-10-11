@@ -85,7 +85,7 @@ func (r *repository) StartTaskSession(ctx context.Context, task *core.Task, laun
 	session, cwd := task.TmuxSession, task.WorktreePath
 	switch {
 	case !alreadyExists:
-		if err := r.createSession(ctx, session, window, cwd, task.ID, task.ProviderEnv); err != nil {
+		if err := r.createSession(ctx, session, window, cwd, task, !task.IsScheduled()); err != nil {
 			return err
 		}
 	case !r.windowExists(ctx, session, window):
@@ -725,15 +725,19 @@ func (r *repository) RespawnTaskPane(ctx context.Context, task *core.Task) error
 	return nil
 }
 
+// createSession starts the task's tmux session with its task window and, when
+// withEditor is set, an "editor" window beside it. A Scheduled task's session
+// has the task window alone.
 func (r *repository) createSession(
 	ctx context.Context,
-	sessionName, window, workingDir, taskID string,
-	providerEnv core.ProviderEnv,
+	sessionName, window, workingDir string,
+	task *core.Task,
+	withEditor bool,
 ) error {
 	sessionName = normalizedSessionName(sessionName)
 
 	args := []string{"new-session", "-d", "-s", sessionName, "-n", window, "-c", workingDir}
-	args = append(args, taskEnvArgs(taskID, providerEnv)...)
+	args = append(args, taskEnvArgs(task.ID, task.ProviderEnv)...)
 
 	_, err := r.runner.Run(ctx, "", "tmux", args...)
 	if err != nil {
@@ -741,6 +745,9 @@ func (r *repository) createSession(
 	}
 
 	r.sleep(promptSubmitDelay)
+	if !withEditor {
+		return nil
+	}
 
 	_, err = r.runner.Run(
 		ctx,

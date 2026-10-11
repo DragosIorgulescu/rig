@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/BaronBonet/rig/internal/core"
 )
@@ -187,6 +188,48 @@ func (f *frontend) NewTaskSessionStream(
 
 func (f *frontend) GetLaunchSettings(ctx context.Context, env core.ProviderEnv) (*core.LaunchSettings, error) {
 	return callUnary(ctx, f, opGetLaunchSettings, launchSettingsRequest{Env: env})
+}
+
+func (f *frontend) ListTaskSchedules(ctx context.Context) ([]core.ScheduledTask, error) {
+	return callUnary(ctx, f, opListTaskSchedules, emptyResponse{})
+}
+
+func (f *frontend) UpdateTaskSchedule(
+	ctx context.Context,
+	taskID string,
+	update core.ScheduleInput,
+	expectedUpdatedAt time.Time,
+) (*core.ScheduledTask, error) {
+	schedule, err := callUnary(ctx, f, opUpdateTaskSchedule, updateTaskScheduleRequest{
+		TaskID:            taskID,
+		ExpectedUpdatedAt: expectedUpdatedAt,
+		ScheduleInput:     update,
+	})
+	// Errors cross the socket as text; a conflict is told apart by callers.
+	if err != nil && err.Error() == core.ErrScheduleConflict.Error() {
+		return nil, core.ErrScheduleConflict
+	}
+	return schedule, err
+}
+
+func (f *frontend) SetTaskScheduleEnabled(
+	ctx context.Context,
+	taskID string,
+	enabled bool,
+) (*core.ScheduledTask, error) {
+	schedule, err := callUnary(ctx, f, opSetTaskScheduleEnabled, setTaskScheduleEnabledRequest{
+		TaskID:  taskID,
+		Enabled: enabled,
+	})
+	if err != nil && err.Error() == core.ErrScheduleConflict.Error() {
+		return nil, core.ErrScheduleConflict
+	}
+	return schedule, err
+}
+
+func (f *frontend) RunTaskScheduleNow(ctx context.Context, taskID string) error {
+	_, err := callUnary(ctx, f, opRunTaskScheduleNow, taskIDRequest{TaskID: taskID})
+	return err
 }
 
 func (f *frontend) RetryTaskCreationStream(

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -90,6 +91,17 @@ type taskRepositoryState struct {
 	// two reads of it.
 	onListTasks func(call int)
 	listCalls   int
+	// schedules are the stored schedules by Task ID, in the order they were
+	// created, and scheduleErr fails the creation of one. beforeClaim runs
+	// ahead of every claim of a run, outside mu, for example to have another
+	// caller win it. All are guarded by mu apart from the hook.
+	schedules     map[string]ScheduledTask
+	scheduleOrder []string
+	scheduleErr   error
+	claimErr      error
+	// upsertStatusErr fails the storing of a status.
+	upsertStatusErr error
+	beforeClaim     func(taskID string)
 }
 
 type repoClientState struct {
@@ -212,8 +224,10 @@ type providerClientState struct {
 	// configuration reaches its provider.
 	suggestEnv    ProviderEnv
 	sessionEnvEnv ProviderEnv
-	listEnv       ProviderEnv
-	listLimit     int
+	// suggestPrompts are the prompts tasks were named after.
+	suggestPrompts []string
+	listEnv        ProviderEnv
+	listLimit      int
 	// promptRunSpec, when it holds anything, is what a prompt run's launch
 	// spec is built as, whatever the request.
 	promptRunSpec     TaskSessionLaunchSpec
@@ -305,6 +319,7 @@ func newTestTaskService(t *testing.T) *testTaskServiceHarness {
 	h.taskRepo.activityByTask = make(map[string][]TaskActivityEvent)
 	h.taskRepo.subscribers = make(map[string][]chan TaskStatusUpdate)
 	h.taskRepo.subscribeCalls = make(map[string]int)
+	h.taskRepo.schedules = make(map[string]ScheduledTask)
 	h.taskRepoMock = NewMockTaskRepository(t)
 	h.repoClientMock = NewMockGitWorktreeClient(t)
 	h.sessionClientMock = NewMockTmuxSessionClient(t)
@@ -339,6 +354,7 @@ func newTestTaskService(t *testing.T) *testTaskServiceHarness {
 		EnableWorkspaceSetup: true,
 		ProviderConfig:       h.providerConfigMock,
 		PromptFiles:          h.promptFilesMock,
+		ScheduleCalculator:   fakeCalculator{},
 	})
 	h.creation = h.service.creation
 	h.launcher = h.service.launcher
@@ -652,7 +668,8 @@ func configureProviderClientMock(client *MockProviderClient, state *providerClie
 		},
 	).Maybe()
 	client.EXPECT().SuggestTaskName(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
-		func(_ context.Context, _ string, env ProviderEnv) (TaskSuggestion, error) {
+		func(_ context.Context, prompt string, env ProviderEnv) (TaskSuggestion, error) {
+			state.suggestPrompts = append(state.suggestPrompts, prompt)
 			state.suggestEnv = env
 			if state.suggestErr != nil {
 				return TaskSuggestion{}, state.suggestErr
@@ -1004,6 +1021,9 @@ func configureTaskRepositoryMock(repo *MockTaskRepository, state *taskRepository
 	).Maybe()
 	repo.EXPECT().UpsertTaskStatus(mock.Anything, mock.Anything).RunAndReturn(
 		func(_ context.Context, update TaskStatusUpdate) error {
+			if state.upsertStatusErr != nil {
+				return state.upsertStatusErr
+			}
 			state.mu.Lock()
 			state.latestByTask[update.TaskID] = update
 			subscribers := append([]chan TaskStatusUpdate(nil), state.subscribers[update.TaskID]...)
@@ -1068,6 +1088,7 @@ func configureTaskRepositoryMock(repo *MockTaskRepository, state *taskRepository
 			return append([]TaskProviderSession(nil), state.providerSessionsByTask[taskID]...), nil
 		},
 	).Maybe()
+	configureScheduledTaskRepositoryMock(repo, state)
 	repo.EXPECT().SubscribeTaskStatus(mock.Anything, mock.Anything).RunAndReturn(
 		func(ctx context.Context, taskID string) (<-chan TaskStatusUpdate, error) {
 			updates := make(chan TaskStatusUpdate, 8)
@@ -1115,4 +1136,156 @@ func cloneTask(task *Task) *Task {
 
 	copy := *task
 	return &copy
+}
+
+// configureScheduledTaskRepositoryMock backs the schedule half of the task
+// repository with a map that behaves as the sqlite adapter does, apart from
+// the cascade: an update checks the version, a claim is a compare-and-swap, and
+// a run's record is written under the same guards.
+func configureScheduledTaskRepositoryMock(repo *MockTaskRepository, state *taskRepositoryState) {
+	repo.EXPECT().CreateScheduledTask(mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, schedule ScheduledTask) error {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if state.scheduleErr != nil {
+				return state.scheduleErr
+			}
+			if _, exists := state.schedules[schedule.TaskID]; exists {
+				return errors.New("schedule already exists")
+			}
+			state.schedules[schedule.TaskID] = schedule
+			state.scheduleOrder = append(state.scheduleOrder, schedule.TaskID)
+			return nil
+		},
+	).Maybe()
+	repo.EXPECT().GetScheduledTask(mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, taskID string) (*ScheduledTask, error) {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			schedule, ok := state.schedules[taskID]
+			if !ok {
+				return nil, nil
+			}
+			return &schedule, nil
+		},
+	).Maybe()
+	repo.EXPECT().ListScheduledTasks(mock.Anything).RunAndReturn(
+		func(context.Context) ([]ScheduledTask, error) {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			var schedules []ScheduledTask
+			for _, taskID := range state.scheduleOrder {
+				if schedule, ok := state.schedules[taskID]; ok {
+					schedules = append(schedules, schedule)
+				}
+			}
+			return schedules, nil
+		},
+	).Maybe()
+	repo.EXPECT().UpdateScheduledTask(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, update ScheduledTask, expectedUpdatedAt time.Time) error {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			stored, ok := state.schedules[update.TaskID]
+			if !ok {
+				return ErrScheduleNotFound
+			}
+			if !stored.UpdatedAt.Equal(expectedUpdatedAt) {
+				return ErrScheduleConflict
+			}
+			stored.ScheduleInput = update.ScheduleInput
+			stored.Enabled = update.Enabled
+			stored.NextRunAt = update.NextRunAt
+			stored.UpdatedAt = update.UpdatedAt
+			state.schedules[update.TaskID] = stored
+			return nil
+		},
+	).Maybe()
+	repo.EXPECT().ClaimScheduledRun(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, taskID string, dueAt time.Time, nextRunAt time.Time) (bool, error) {
+			if state.beforeClaim != nil {
+				state.beforeClaim(taskID)
+			}
+			if state.claimErr != nil {
+				return false, state.claimErr
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			stored, ok := state.schedules[taskID]
+			if !ok || !stored.Enabled || !stored.NextRunAt.Equal(dueAt) {
+				return false, nil
+			}
+			stored.NextRunAt = nextRunAt
+			state.schedules[taskID] = stored
+			return true, nil
+		},
+	).Maybe()
+	repo.EXPECT().StartScheduledRun(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, taskID string, at time.Time, detail string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if stored, ok := state.schedules[taskID]; ok {
+				stored.RunState = ScheduledRunStateRunning
+				stored.RunStartedAt = at
+				stored.LastRunAt = at
+				stored.LastOutcome = ScheduledRunRunning
+				stored.LastDetail = detail
+				state.schedules[taskID] = stored
+			}
+			return nil
+		},
+	).Maybe()
+	repo.EXPECT().SkipScheduledRun(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, taskID string, at time.Time, detail string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if stored, ok := state.schedules[taskID]; ok && stored.RunState == ScheduledRunStateIdle {
+				stored.LastRunAt = at
+				stored.LastOutcome = ScheduledRunSkipped
+				stored.LastDetail = detail
+				state.schedules[taskID] = stored
+			}
+			return nil
+		},
+	).Maybe()
+	repo.EXPECT().FailScheduledRun(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, taskID string, at time.Time, detail string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if stored, ok := state.schedules[taskID]; ok {
+				stored.RunState = ScheduledRunStateIdle
+				stored.LastRunAt = at
+				stored.LastOutcome = ScheduledRunFailed
+				stored.LastDetail = detail
+				state.schedules[taskID] = stored
+			}
+			return nil
+		},
+	).Maybe()
+	repo.EXPECT().ResolveScheduledRun(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(_ context.Context, taskID string, outcome ScheduledRunOutcome, detail string) (bool, error) {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			stored, ok := state.schedules[taskID]
+			if !ok || stored.RunState != ScheduledRunStateRunning {
+				return false, nil
+			}
+			stored.RunState = ScheduledRunStateIdle
+			stored.LastOutcome = outcome
+			if detail != "" {
+				stored.LastDetail = detail
+			}
+			state.schedules[taskID] = stored
+			return true, nil
+		},
+	).Maybe()
 }

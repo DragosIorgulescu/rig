@@ -55,6 +55,8 @@ type Task struct {
 	// sessions, which became its DisplayName. A session renames its Task only
 	// when that title changes, so a rename made in Rig is not undone.
 	SessionTitle string `json:"session_title,omitempty"`
+	// Kind is what sort of Task this is; empty for an ordinary Task.
+	Kind TaskKind `json:"kind,omitempty"`
 }
 
 // Rename gives the Task a new name, for the new purpose it is being reused

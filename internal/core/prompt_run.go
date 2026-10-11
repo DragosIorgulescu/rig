@@ -152,27 +152,45 @@ func newPromptRun(input RunTaskPromptInput) (promptRun, error) {
 	if run.taskID == "" {
 		return promptRun{}, fmt.Errorf("task ID is required")
 	}
-	if strings.TrimSpace(run.prompt) == "" {
-		return promptRun{}, fmt.Errorf("prompt is required")
+	if err := checkPromptRunPrompt(run.prompt); err != nil {
+		return promptRun{}, err
 	}
-	if len(run.prompt) > maxPromptRunPromptBytes {
-		return promptRun{}, fmt.Errorf("prompt is too long: %d bytes, and a prompt run takes at most %d",
-			len(run.prompt), maxPromptRunPromptBytes)
+	sessionMode, err := parsePromptRunSessionMode(run.sessionMode)
+	if err != nil {
+		return promptRun{}, err
 	}
-	switch run.sessionMode {
-	case "":
-		run.sessionMode = PromptRunSessionNew
-	case PromptRunSessionNew, PromptRunSessionSame:
-	default:
-		return promptRun{}, fmt.Errorf("unknown session mode %q: use %s or %s",
-			run.sessionMode, PromptRunSessionNew, PromptRunSessionSame)
-	}
+	run.sessionMode = sessionMode
 	mode, err := ParseTaskPermissionMode(string(input.PermissionMode))
 	if err != nil {
 		return promptRun{}, err
 	}
 	run.permissionMode = mode
 	return run, nil
+}
+
+// checkPromptRunPrompt reports why a prompt cannot be a prompt run's.
+func checkPromptRunPrompt(prompt string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf("prompt is required")
+	}
+	if len(prompt) > maxPromptRunPromptBytes {
+		return fmt.Errorf("prompt is too long: %d bytes, and a prompt run takes at most %d",
+			len(prompt), maxPromptRunPromptBytes)
+	}
+	return nil
+}
+
+// parsePromptRunSessionMode returns the session mode a name stands for; an
+// empty name is PromptRunSessionNew.
+func parsePromptRunSessionMode(mode PromptRunSessionMode) (PromptRunSessionMode, error) {
+	switch mode {
+	case "":
+		return PromptRunSessionNew, nil
+	case PromptRunSessionNew, PromptRunSessionSame:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unknown session mode %q: use %s or %s", mode, PromptRunSessionNew, PromptRunSessionSame)
+	}
 }
 
 func promptRunSkipped(reason string) RunTaskPromptResult {
@@ -183,8 +201,8 @@ func promptRunFailed(detail string) RunTaskPromptResult {
 	return RunTaskPromptResult{Outcome: PromptRunFailed, Detail: detail}
 }
 
-func promptRunStarted(detail string) RunTaskPromptResult {
-	return RunTaskPromptResult{Outcome: PromptRunStarted, Detail: detail}
+func promptRunStarted(detail string, startedAt time.Time) RunTaskPromptResult {
+	return RunTaskPromptResult{Outcome: PromptRunStarted, Detail: detail, StartedAt: startedAt}
 }
 
 // runTaskPrompt is RunTaskPrompt once the Task's operation lock is held. An
@@ -307,7 +325,7 @@ func (s *service) sendPromptToSession(
 	if !taken {
 		return promptRunFailed("the session didn't take the prompt"), nil
 	}
-	return promptRunStarted("sent to the running session"), nil
+	return promptRunStarted("sent to the running session", sentAt), nil
 }
 
 // awaitPromptSent waits until the session shows it took the prompt sent at
@@ -423,11 +441,11 @@ func (s *service) startPromptRunSession(
 
 	switch {
 	case resumeSessionID != "":
-		return promptRunStarted("resumed " + shortSessionID(resumeSessionID)), nil
+		return promptRunStarted("resumed "+shortSessionID(resumeSessionID), launchedAt), nil
 	case run.sessionMode == PromptRunSessionSame:
-		return promptRunStarted("no previous session, started fresh"), nil
+		return promptRunStarted("no previous session, started fresh", launchedAt), nil
 	default:
-		return promptRunStarted("started fresh"), nil
+		return promptRunStarted("started fresh", launchedAt), nil
 	}
 }
 

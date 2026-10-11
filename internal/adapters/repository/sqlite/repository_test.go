@@ -803,6 +803,8 @@ func TestRepositoryNew_MigratesDatabaseWithSquashedMigrationHistory(t *testing.T
 		"alter table tasks drop column tmux_window",
 		"alter table tasks drop column shelved_at",
 		"alter table tasks drop column session_title",
+		"drop table scheduled_tasks",
+		"alter table tasks drop column kind",
 		"delete from goose_db_version where version_id > 1",
 		"insert into goose_db_version (version_id, is_applied) values (2, 1), (3, 1), (4, 1), (5, 1)",
 	} {
@@ -819,6 +821,11 @@ func TestRepositoryNew_MigratesDatabaseWithSquashedMigrationHistory(t *testing.T
 		"background_monitors",
 		"background_workflows",
 		"background_other",
+	})
+	require.Contains(t, tableColumnNames(t, reopened.db, "tasks"), "kind")
+	require.Subset(t, tableColumnNames(t, reopened.db, "scheduled_tasks"), []string{
+		"task_id", "cron", "prompt", "session_mode", "permission_mode", "enabled", "next_run_at",
+		"run_state", "run_started_at", "last_run_at", "last_outcome", "last_detail", "created_at", "updated_at",
 	})
 }
 
@@ -854,9 +861,17 @@ func TestRepositoryNew_SettlesStatusesNoHookWouldEverReplace(t *testing.T) {
 			FirstObservedAt: now, LastObservedAt: now, LastEventName: "SessionStart",
 		}))
 	}
-	// Rewind to before the migration, as an older database would be.
-	_, err := repo.db.ExecContext(ctx, "delete from goose_db_version where version_id = 14")
-	require.NoError(t, err)
+	// Rewind to before the migration, as an older database would be: the
+	// later scheduled-task migration goes too, since goose does not apply
+	// one out of order.
+	for _, statement := range []string{
+		"drop table scheduled_tasks",
+		"alter table tasks drop column kind",
+		"delete from goose_db_version where version_id >= 14",
+	} {
+		_, err := repo.db.ExecContext(ctx, statement)
+		require.NoError(t, err, statement)
+	}
 	require.NoError(t, repo.db.Close())
 
 	reopened := newTestRepositoryAtPath(t, path)
@@ -984,6 +999,7 @@ func TestRepositoryNew_CreatesSchemaForTasksAndLatestStatuses(t *testing.T) {
 		"tmux_window",
 		"shelved_at",
 		"session_title",
+		"kind",
 	}
 	if !reflect.DeepEqual(names, wantTasks) {
 		t.Fatalf("unexpected tasks columns:\n got: %#v\nwant: %#v", names, wantTasks)
@@ -1029,6 +1045,27 @@ func TestRepositoryNew_CreatesSchemaForTasksAndLatestStatuses(t *testing.T) {
 	}
 	if !reflect.DeepEqual(activityNames, wantActivity) {
 		t.Fatalf("unexpected task_activity columns:\n got: %#v\nwant: %#v", activityNames, wantActivity)
+	}
+
+	scheduleNames := tableColumnNames(t, repo.db, "scheduled_tasks")
+	wantSchedule := []string{
+		"task_id",
+		"cron",
+		"prompt",
+		"session_mode",
+		"permission_mode",
+		"enabled",
+		"next_run_at",
+		"run_state",
+		"run_started_at",
+		"last_run_at",
+		"last_outcome",
+		"last_detail",
+		"created_at",
+		"updated_at",
+	}
+	if !reflect.DeepEqual(scheduleNames, wantSchedule) {
+		t.Fatalf("unexpected scheduled_tasks columns:\n got: %#v\nwant: %#v", scheduleNames, wantSchedule)
 	}
 }
 

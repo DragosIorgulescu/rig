@@ -100,14 +100,29 @@ func requireNothingDone(t *testing.T, svc *testTaskServiceHarness) {
 func requireSkipped(t *testing.T, svc *testTaskServiceHarness, result RunTaskPromptResult, detail string) {
 	t.Helper()
 
-	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunSkipped, Detail: detail}, result)
+	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunSkipped, Detail: detail}, withoutStartTime(t, result))
 	requireNothingDone(t, svc)
+}
+
+// withoutStartTime checks that a started run says when it started, and
+// returns the result without it, for comparing the rest.
+func withoutStartTime(t *testing.T, result RunTaskPromptResult) RunTaskPromptResult {
+	t.Helper()
+
+	if result.Outcome == PromptRunStarted {
+		require.False(t, result.StartedAt.IsZero(), "a started run says when it started")
+		require.WithinDuration(t, time.Now(), result.StartedAt, time.Minute)
+	} else {
+		require.True(t, result.StartedAt.IsZero(), "only a started run has a start time")
+	}
+	result.StartedAt = time.Time{}
+	return result
 }
 
 func requireStarted(t *testing.T, svc *testTaskServiceHarness, result RunTaskPromptResult, detail string) {
 	t.Helper()
 
-	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunStarted, Detail: detail}, result)
+	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunStarted, Detail: detail}, withoutStartTime(t, result))
 	require.NotNil(t, svc.sessionClient.startedTask, "a started run launches the provider")
 	require.Empty(t, svc.sessionClient.submittedPrompts, "a launch types nothing into the provider")
 }
@@ -115,7 +130,11 @@ func requireStarted(t *testing.T, svc *testTaskServiceHarness, result RunTaskPro
 func requireSent(t *testing.T, svc *testTaskServiceHarness, result RunTaskPromptResult, prompt string) {
 	t.Helper()
 
-	require.Equal(t, RunTaskPromptResult{Outcome: PromptRunStarted, Detail: "sent to the running session"}, result)
+	require.Equal(
+		t,
+		RunTaskPromptResult{Outcome: PromptRunStarted, Detail: "sent to the running session"},
+		withoutStartTime(t, result),
+	)
 	require.Equal(t, []string{prompt}, svc.sessionClient.submittedPrompts)
 	require.Nil(t, svc.sessionClient.startedTask, "the running session is not launched again")
 	require.Empty(t, svc.sessionClient.respawnedTasks, "the running session is not ended")
@@ -1130,7 +1149,11 @@ func TestTaskServiceRunTaskPrompt_HoldsTheTaskUntilTheProviderHasTakenThePrompt(
 	require.Eventually(t, isDone, 5*time.Second, time.Millisecond)
 	done := <-finished
 	require.NoError(t, done.err)
-	require.Equal(t, promptRunStarted("started fresh"), done.result)
+	require.Equal(
+		t,
+		RunTaskPromptResult{Outcome: PromptRunStarted, Detail: "started fresh"},
+		withoutStartTime(t, done.result),
+	)
 	require.NoError(t, svc.service.operations.Run(
 		t.Context(), "task-1", taskOperationRename, false, func(context.Context) error { return nil },
 	))

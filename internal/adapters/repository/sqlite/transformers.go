@@ -33,6 +33,7 @@ func createTaskParams(task *core.Task) generated.CreateTaskParams {
 		TmuxWindow:     task.TmuxWindow,
 		ShelvedAt:      formatTime(task.ShelvedAt),
 		SessionTitle:   task.SessionTitle,
+		Kind:           string(task.Kind),
 	}
 }
 
@@ -60,6 +61,7 @@ func updateTaskParams(task *core.Task) generated.UpdateTaskParams {
 		TmuxWindow:     task.TmuxWindow,
 		ShelvedAt:      formatTime(task.ShelvedAt),
 		SessionTitle:   task.SessionTitle,
+		Kind:           string(task.Kind),
 		ID:             task.ID,
 	}
 }
@@ -186,6 +188,7 @@ func taskFromRow(row generated.ListTasksRow) *core.Task {
 		TmuxWindow:     row.TmuxWindow,
 		ShelvedAt:      parseTime(row.ShelvedAt),
 		SessionTitle:   row.SessionTitle,
+		Kind:           core.TaskKind(row.Kind),
 	}
 }
 
@@ -299,4 +302,51 @@ func taskProviderSessionsFromRows(rows []generated.ListTaskProviderSessionsRow) 
 		sessions = append(sessions, taskProviderSessionFromRow(row))
 	}
 	return sessions
+}
+
+func createScheduledTaskParams(schedule core.ScheduledTask) generated.CreateScheduledTaskParams {
+	return generated.CreateScheduledTaskParams{
+		TaskID:         schedule.TaskID,
+		Cron:           schedule.Cron,
+		Prompt:         schedule.Prompt,
+		SessionMode:    string(schedule.SessionMode),
+		PermissionMode: string(schedule.PermissionMode),
+		Enabled:        boolToInt(schedule.Enabled),
+		NextRunAt:      formatTime(schedule.NextRunAt),
+		RunState:       string(schedule.RunState),
+		RunStartedAt:   formatTime(schedule.RunStartedAt),
+		LastRunAt:      formatTime(schedule.LastRunAt),
+		LastOutcome:    string(schedule.LastOutcome),
+		LastDetail:     schedule.LastDetail,
+		CreatedAt:      formatTime(schedule.CreatedAt),
+		UpdatedAt:      formatTime(schedule.UpdatedAt),
+	}
+}
+
+func scheduledTaskFromRow(row generated.ScheduledTask) core.ScheduledTask {
+	return core.ScheduledTask{
+		TaskID: row.TaskID,
+		ScheduleInput: core.ScheduleInput{
+			Cron:           row.Cron,
+			Prompt:         row.Prompt,
+			SessionMode:    core.PromptRunSessionMode(row.SessionMode),
+			PermissionMode: core.TaskPermissionMode(row.PermissionMode),
+		},
+		Enabled:      row.Enabled != 0,
+		NextRunAt:    parseTime(row.NextRunAt),
+		RunState:     core.ScheduledRunState(row.RunState),
+		RunStartedAt: parseTime(row.RunStartedAt),
+		LastRunAt:    parseTime(row.LastRunAt),
+		LastOutcome:  core.ScheduledRunOutcome(row.LastOutcome),
+		LastDetail:   row.LastDetail,
+		CreatedAt:    parseTime(row.CreatedAt),
+		UpdatedAt:    parseTime(row.UpdatedAt),
+	}
+}
+
+func boolToInt(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
 }

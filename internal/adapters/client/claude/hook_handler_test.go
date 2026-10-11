@@ -271,3 +271,51 @@ func TestHookEventToTaskStatus_IgnoresUnmappedEventsAndMissingTask(t *testing.T)
 	_, err = repo.HookEventToTaskStatus(core.HookEventInput{EventName: "Stop"})
 	require.ErrorIs(t, err, core.ErrUnmanagedHookEvent)
 }
+
+func TestDecodeHookEventInput_StopFailureCarriesWhyTheTurnEnded(t *testing.T) {
+	tests := map[string]struct {
+		body string
+		want string
+	}{
+		"the error as the conversation showed it": {
+			body: `{"hook_event_name": "StopFailure", "error": "rate_limit", "error_details": "429 Too Many Requests",
+				"last_assistant_message": "API Error: Rate limit reached"}`,
+			want: "API Error: Rate limit reached",
+		},
+		"the details of the error": {
+			body: `{"hook_event_name": "StopFailure", "error": "rate_limit", "error_details": "429 Too Many Requests"}`,
+			want: "429 Too Many Requests",
+		},
+		"details that are not text": {
+			body: `{"hook_event_name": "StopFailure", "error": "server_error", "error_details": {"status": 500}}`,
+			want: `{"status": 500}`,
+		},
+		"the kind of error": {
+			body: `{"hook_event_name": "StopFailure", "error": "authentication_failed"}`,
+			want: "authentication_failed",
+		},
+		"nothing": {
+			body: `{"hook_event_name": "StopFailure"}`,
+			want: "",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			input := DecodeHookEventInput(fixedNow, "StopFailure", []byte(tt.body))
+
+			require.Equal(t, core.HookEventStopFailure, input.EventName)
+			require.Equal(t, tt.want, input.ErrorText)
+		})
+	}
+}
+
+func TestDecodeHookEventInput_OtherEventsCarryNoErrorText(t *testing.T) {
+	input := DecodeHookEventInput(fixedNow, "Stop", []byte(`{
+		"hook_event_name": "Stop",
+		"error": "rate_limit",
+		"last_assistant_message": "All done"
+	}`))
+
+	require.Empty(t, input.ErrorText)
+	require.Empty(t, input.LastAssistantMessage, "a Stop's message is not recorded as activity by this change")
+}
